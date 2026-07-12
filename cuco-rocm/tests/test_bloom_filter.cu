@@ -10,6 +10,7 @@
 #include <cuco/bloom_filter_policies.cuh>
 
 #include <hip/hip_runtime.h>
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 
@@ -65,6 +66,8 @@ int main() {
   hipFree(d_miss_res);
 
   printf("Result: %d/7 keys found, miss key %s\n", pass, miss_res ? "false positive" : "correctly missing");
-  printf("TEST %s\n", (pass == 7 && !miss_res) ? "PASSED" : "FAILED");
+  assert(pass == 7 && "All inserted keys must be found");
+  assert(!miss_res && "Non-inserted key must not be found (no false positive)");
+  printf("TEST PASSED\n");
   return (pass == 7 && !miss_res) ? 0 : 1;
 }

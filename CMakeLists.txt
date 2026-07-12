@@ -65,3 +65,7 @@ install(EXPORT rocm-cuda-compat-targets
         FILE rocm-cuda-compat-targets.cmake
         NAMESPACE rocm-cuda-compat::
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rocm-cuda-compat)
+
+# Install the config file so find_package(rocm-cuda-compat CONFIG) works
+install(FILES cmake/rocm-cuda-compat-config.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rocm-cuda-compat)

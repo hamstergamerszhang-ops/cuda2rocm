@@ -8,7 +8,7 @@ CUDA→ROCm compatibility tools for porting NVIDIA-only GPU libraries to AMD HIP
 
 The shim layer developed for the [Sirius ROCm port](https://github.com/hamstergamerszhang-ops/sirius/tree/feat/rocm-port), extracted as a standalone header-only library usable by any CUDA→ROCm porting effort:
 
-- `cuda_runtime.h` — 67 `cuda*`→`hip*` macro aliases (verified on gfx942)
+- `cuda_runtime.h` — 68 `cuda*`→`hip*` macro aliases + 6 type aliases (verified on gfx942)
 - `cub/` → hipCUB redirect + `namespace cub = hipcub` + `warp_threads = 64`
 - `cuda/std/*` — CCCL redirects with `#include_next` (defers to hipDF's CCCL when installed)
 - `cuda/functional` — `cuda::minimum`/`cuda::maximum` functors

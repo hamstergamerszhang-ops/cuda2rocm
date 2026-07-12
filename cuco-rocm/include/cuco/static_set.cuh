@@ -103,10 +103,15 @@ class static_set {
       hash_{} {
     (void)alloc; // Allocator accepted for API compat, hipMalloc used
     std::size_t bytes = capacity_ * sizeof(KeyT);
-    hipMalloc(&slots_, bytes);
-    // Fill with empty key: use a kernel or hipMemset for byte-sized keys,
-    // otherwise copy from a host buffer.
-    fill_empty_key<<<1, 1>>>(slots_, empty_key_, capacity_);
+    if (hipMalloc(&slots_, bytes) != hipSuccess) {
+      throw std::runtime_error("cuco::static_set: hipMalloc failed");
+    }
+    // Fill all slots with the empty key. Launch enough threads to cover
+    // the capacity — previously <<<1,1>>> only filled slot 0.
+    std::size_t block = 256;
+    std::size_t grid = (capacity_ + block - 1) / block;
+    if (grid == 0) grid = 1;
+    fill_empty_key<<<grid, block>>>(slots_, empty_key_, capacity_);
   }
 
   __host__ ~static_set() {
