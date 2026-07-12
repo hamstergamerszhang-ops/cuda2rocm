@@ -112,14 +112,19 @@ class memory_reservation_manager {
     // Find a matching space with available memory
     for (auto* s : all_spaces_) {
       if (strategy.matches(*s) && s->get_available_memory() >= bytes) {
-        return s->make_reservation(bytes);
+        auto r = s->make_reservation(bytes);
+        ++active_reservations_;
+        return r;
       }
     }
     // Try make_reservation_or_null on any matching space
     for (auto* s : all_spaces_) {
       if (strategy.matches(*s)) {
         auto r = s->make_reservation_or_null(bytes);
-        if (r) return r;
+        if (r) {
+          ++active_reservations_;
+          return r;
+        }
       }
     }
     throw std::runtime_error("cuCascade: no memory space can satisfy reservation request");

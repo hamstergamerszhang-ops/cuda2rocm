@@ -93,12 +93,3 @@ class data_repository_manager {
 using shared_data_repository_manager = data_repository_manager;
 
 }  // namespace cucascade
-
-namespace std {
-template <>
-struct hash<cucascade::data_repository_manager::operator_port_key> {
-  std::size_t operator()(cucascade::data_repository_manager::operator_port_key const& k) const {
-    return std::hash<std::size_t>{}(k.operator_id) ^ std::hash<std::string_view>{}(k.port_name);
-  }
-};
-}  // namespace std

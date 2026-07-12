@@ -10,6 +10,7 @@
 #include <cuco/operator.hpp>
 
 #include <hip/hip_runtime.h>
+#include <cassert>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -68,6 +69,7 @@ int main() {
   hipFree(d_results);
 
   printf("Result: %d/6 correct\n", pass);
-  printf("TEST %s\n", (pass == 6) ? "PASSED" : "FAILED");
-  return (pass == 6) ? 0 : 1;
+  assert(pass == 6 && "All 5 inserted keys found + 1 non-inserted key correctly missing");
+  printf("TEST PASSED\n");
+  return 0;
 }

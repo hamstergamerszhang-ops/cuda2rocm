@@ -39,6 +39,7 @@ __global__ void bloom_add_kernel(WordT* bits, std::size_t num_blocks,
   KeyT key = keys[idx];
   std::uint64_t hashes[16]; // max k=16
   std::size_t k = policy.num_hash_functions();
+  assert(k <= 16 && "cuco::bloom_filter: num_hash_functions exceeds hardcoded max of 16");
   policy.hash(key, hashes, k);
 
   std::size_t block_idx = hashes[0] % num_blocks;
@@ -68,6 +69,7 @@ __global__ void bloom_probe_kernel(WordT const* bits, std::size_t num_blocks,
   KeyT key = keys[idx];
   std::uint64_t hashes[16];
   std::size_t k = policy.num_hash_functions();
+  assert(k <= 16 && "cuco::bloom_filter: num_hash_functions exceeds hardcoded max of 16");
   policy.hash(key, hashes, k);
 
   std::size_t block_idx = hashes[0] % num_blocks;
@@ -111,15 +113,21 @@ class bloom_filter {
   static constexpr std::size_t bits_per_block = words_per_block * bits_per_word;
 
   /// Constructor: allocates `num_blocks * words_per_block * sizeof(word_type)` bytes.
-  __host__ bloom_filter(Extent block_extent, Policy = {}, int = {},
+  __host__ bloom_filter(Extent block_extent, Policy policy = {}, int = {},
                         Allocator alloc = {}, hipStream_t stream = 0)
     : block_extent_(static_cast<std::size_t>(block_extent)),
-      policy_{},
+      policy_(policy),
       stream_(stream) {
     (void)alloc; // Allocator accepted for API compat, hipMalloc used
     std::size_t bytes = block_extent_ * words_per_block * sizeof(word_type);
-    hipMalloc(&bits_, bytes);
-    hipMemsetAsync(bits_, 0, bytes, stream);
+    if (hipMalloc(&bits_, bytes) != hipSuccess) {
+      throw std::runtime_error("cuco::bloom_filter: hipMalloc failed");
+    }
+    if (hipMemsetAsync(bits_, 0, bytes, stream) != hipSuccess) {
+      hipFree(bits_);
+      bits_ = nullptr;
+      throw std::runtime_error("cuco::bloom_filter: hipMemsetAsync failed");
+    }
   }
 
   __host__ ~bloom_filter() {
