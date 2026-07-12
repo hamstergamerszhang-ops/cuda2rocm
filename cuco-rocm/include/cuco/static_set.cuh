@@ -46,6 +46,13 @@ struct double_hashing {
 
 namespace detail {
 
+template <typename KeyT>
+__global__ void fill_empty_key_kernel(KeyT* slots, KeyT empty, std::size_t n) {
+  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    slots[i] = empty;
+  }
+}
+
 template <typename KeyT, typename Hash, typename InputIt>
 __global__ void set_insert_kernel(KeyT* slots, std::size_t capacity,
                                    KeyT empty_key, Hash hash,
@@ -111,11 +118,17 @@ class static_set {
     std::size_t block = 256;
     std::size_t grid = (capacity_ + block - 1) / block;
     if (grid == 0) grid = 1;
-    fill_empty_key<<<grid, block>>>(slots_, empty_key_, capacity_);
+    detail::fill_empty_key_kernel<KeyT><<<grid, block>>>(slots_, empty_key_, capacity_);
+    last_stream_ = 0;  // default stream for the fill kernel
   }
 
   __host__ ~static_set() {
-    if (slots_) hipFree(slots_);
+    if (slots_) {
+      // Sync the last insert/fill stream before freeing — hipFree does NOT
+      // sync non-default streams.
+      hipStreamSynchronize(last_stream_);
+      hipFree(slots_);
+    }
   }
 
   static_set(static_set const&) = delete;
@@ -128,6 +141,7 @@ class static_set {
   /// Async insert a range of keys.
   template <typename InputIt>
   __host__ void insert_async(InputIt first, InputIt last, hipStream_t stream) {
+    last_stream_ = stream;
     auto n = static_cast<std::size_t>(last - first);
     if (n == 0) return;
     std::size_t block = 256;
@@ -146,13 +160,7 @@ class static_set {
   std::size_t capacity_{};
   KeyT empty_key_{};
   Hash hash_{};
-
-  /// Fill slots with empty key using a simple kernel.
-  __global__ static void fill_empty_key(KeyT* slots, KeyT empty, std::size_t n) {
-    for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) {
-      slots[i] = empty;
-    }
-  }
+  hipStream_t last_stream_{0};  // tracked for destructor sync
 };
 
 }  // namespace cuco
