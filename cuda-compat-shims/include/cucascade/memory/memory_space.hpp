@@ -1,30 +1,31 @@
 /*
- * Copyright 2026, Sirius Contributors.
+ * Copyright 2026, rocm-cuda-compat contributors.
  * Licensed under the Apache License, Version 2.0 (see LICENSE).
  */
 
-//! @file
-//! cuCascade memory_space — ROCm stub.
+//! @file cuCascade memory_space — ROCm real implementation.
 //! The central type: ties together a tier, device, stream pool, and allocator.
+//! Resource accessors return real pointers to stored resource objects.
 
 #pragma once
 
 #include "cucascade/memory/common.hpp"
 #include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/stream_pool.hpp"
+#include "cucascade/memory/reservation_aware_resource_adaptor.hpp"
+#include "cucascade/memory/fixed_size_host_memory_resource.hpp"
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 
 namespace cucascade::memory {
 
 /// A memory space represents a tier (GPU/HOST/DISK) on a specific device,
-/// with an associated allocator and stream pool. This stub provides the
-/// interface Sirius calls; methods throw at runtime (graceful degradation
-/// to DuckDB CPU execution).
+/// with an associated allocator and stream pool.
 class memory_space {
  public:
   memory_space(Tier tier, int32_t device_id,
@@ -38,18 +39,18 @@ class memory_space {
   rmm::device_async_resource_ref get_default_allocator() const { return allocator_; }
 
   rmm::cuda_stream_view acquire_stream() {
-    if (!streams_) throw std::runtime_error("cuCascade stub: no stream pool");
+    if (!streams_) throw std::runtime_error("cuCascade: no stream pool");
     return streams_->acquire_stream(stream_acquire_policy::GROW);
   }
-  // Const overload — Sirius calls acquire_stream() on memory_space const&
   rmm::cuda_stream_view acquire_stream() const {
+    if (streams_) return streams_->acquire_stream(stream_acquire_policy::GROW);
     return rmm::cuda_stream_per_thread;
   }
 
   bool should_downgrade_memory() const { return false; }
 
   std::string to_string() const {
-    return "cuCascade stub memory_space(tier=" + std::to_string(static_cast<int>(tier_)) +
+    return "cuCascade memory_space(tier=" + std::to_string(static_cast<int>(tier_)) +
            ",device=" + std::to_string(device_id_) + ")";
   }
 
@@ -57,28 +58,26 @@ class memory_space {
   bool operator!=(memory_space const& other) const { return !(*this == other); }
 
   /// Template: get memory resource as a specific type.
-  /// Throws — cuCascade stub has no real reservation system. The exception
-  /// propagates up; Sirius's error handling catches it and falls back to
-  /// DuckDB CPU execution.
+  /// Returns a pointer to the stored resource if T matches, nullptr otherwise.
+  /// Sirius calls this with T = reservation_aware_resource_adaptor (GPU tier)
+  /// or T = fixed_size_host_memory_resource (HOST tier).
   template <typename T>
   T* get_memory_resource_as() {
-    throw std::runtime_error("cuCascade stub: get_memory_resource_as<T>() — no reservation system");
+    return get_resource_ptr<T>();
   }
-  // Const overload — Sirius calls get_memory_resource_as<T>() on const memory_space&
   template <typename T>
   T const* get_memory_resource_as() const {
-    throw std::runtime_error("cuCascade stub: get_memory_resource_as<T>() const — no reservation system");
+    return get_resource_ptr<T>();
   }
 
   /// Template: get memory resource for a specific tier.
   template <Tier TIER>
   typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of() {
-    throw std::runtime_error("cuCascade stub: get_memory_resource_of<TIER>() — no reservation system");
+    return get_resource_ptr<typename tier_memory_resource_trait<TIER>::type>();
   }
-  // Const overload
   template <Tier TIER>
   typename tier_memory_resource_trait<TIER>::type const* get_memory_resource_of() const {
-    throw std::runtime_error("cuCascade stub: get_memory_resource_of<TIER>() const — no reservation system");
+    return get_resource_ptr<typename tier_memory_resource_trait<TIER>::type>();
   }
 
   // --- Memory tracking (real: tracks allocated/reserved bytes) ---
@@ -110,6 +109,15 @@ class memory_space {
 
   void release_reservation(std::size_t bytes) { if (reserved_memory_ >= bytes) reserved_memory_ -= bytes; }
 
+  // --- Setters (used by memory_reservation_manager during construction) ---
+  void set_max_memory(std::size_t bytes) { max_memory_ = bytes; }
+  void set_gpu_resource(std::unique_ptr<reservation_aware_resource_adaptor> res) {
+    gpu_resource_ = std::move(res);
+  }
+  void set_host_resource(std::unique_ptr<fixed_size_host_memory_resource> res) {
+    host_resource_ = std::move(res);
+  }
+
  private:
   Tier tier_;
   int32_t device_id_;
@@ -118,9 +126,34 @@ class memory_space {
   std::size_t max_memory_{0};
   std::size_t reserved_memory_{0};
 
-  /// Simple arena: tracks a byte count (no actual allocation — the
-  /// reservation is bookkeeping; actual device memory is allocated
-  /// separately via the allocator or hipMalloc).
+  // Stored resources — one per tier. get_memory_resource_as<T>() returns
+  // the matching one (or nullptr if T doesn't match any stored resource).
+  std::unique_ptr<reservation_aware_resource_adaptor> gpu_resource_;
+  std::unique_ptr<fixed_size_host_memory_resource> host_resource_;
+
+  /// Helper: return pointer to stored resource if T matches.
+  template <typename T>
+  T* get_resource_ptr() {
+    if constexpr (std::is_same_v<T, reservation_aware_resource_adaptor>) {
+      return gpu_resource_.get();
+    } else if constexpr (std::is_same_v<T, fixed_size_host_memory_resource>) {
+      return host_resource_.get();
+    } else {
+      return nullptr;
+    }
+  }
+  template <typename T>
+  T const* get_resource_ptr() const {
+    if constexpr (std::is_same_v<T, reservation_aware_resource_adaptor>) {
+      return gpu_resource_.get();
+    } else if constexpr (std::is_same_v<T, fixed_size_host_memory_resource>) {
+      return host_resource_.get();
+    } else {
+      return nullptr;
+    }
+  }
+
+  /// Simple arena: tracks a byte count.
   class simple_arena : public reserved_arena {
    public:
     explicit simple_arena(std::size_t n) : bytes_(n) {}
