@@ -132,6 +132,10 @@ class bloom_filter {
 
   __host__ ~bloom_filter() {
     if (bits_) {
+      // Sync the construction/insert stream before freeing — hipFree does
+      // NOT sync non-default streams, so async ops on stream_ could still
+      // be reading/writing bits_ when we free it.
+      hipStreamSynchronize(stream_);
       hipFree(bits_);
     }
   }
