@@ -35,25 +35,41 @@ struct any_memory_space_in_tier_with_preference : reservation_request_strategy {
   Tier tier;
   int32_t preferred_device{-1};
   explicit any_memory_space_in_tier_with_preference(Tier t, int32_t dev = -1) : tier(t), preferred_device(dev) {}
+  bool matches(memory_space const& s) const override {
+    if (s.get_tier() != tier) return false;
+    return preferred_device < 0 || s.get_device_id() == preferred_device;
+  }
 };
 
 struct any_memory_space_in_tier : reservation_request_strategy {
   Tier tier;
   explicit any_memory_space_in_tier(Tier t) : tier(t) {}
+  bool matches(memory_space const& s) const override { return s.get_tier() == tier; }
 };
 
 struct any_memory_space_in_tiers : reservation_request_strategy {
   std::vector<Tier> tiers;
   explicit any_memory_space_in_tiers(std::vector<Tier> t) : tiers(std::move(t)) {}
+  bool matches(memory_space const& s) const override {
+    for (auto t : tiers) {
+      if (s.get_tier() == t) return true;
+    }
+    return false;
+  }
 };
 
 struct specific_memory_space : reservation_request_strategy {
   memory_space_id id;
   explicit specific_memory_space(memory_space_id i) : id(i) {}
+  bool matches(memory_space const& s) const override { return s.get_id() == id; }
 };
 
-struct any_memory_space_to_downgrade : reservation_request_strategy {};
-struct any_memory_space_to_upgrade : reservation_request_strategy {};
+struct any_memory_space_to_downgrade : reservation_request_strategy {
+  bool matches(memory_space const& s) const override { return s.get_tier() == Tier::GPU; }
+};
+struct any_memory_space_to_upgrade : reservation_request_strategy {
+  bool matches(memory_space const& s) const override { return s.get_tier() != Tier::GPU; }
+};
 
 /// Manages memory spaces and reservations across GPU/Host/Disk tiers.
 /// Sirius subclasses this (sirius_memory_reservation_manager) — must be a
@@ -112,7 +128,7 @@ class memory_reservation_manager {
     // Find a matching space with available memory
     for (auto* s : all_spaces_) {
       if (strategy.matches(*s) && s->get_available_memory() >= bytes) {
-        auto r = s->make_reservation(bytes);
+        auto r = s->make_reservation(bytes, [this]() { --active_reservations_; });
         ++active_reservations_;
         return r;
       }
@@ -120,11 +136,9 @@ class memory_reservation_manager {
     // Try make_reservation_or_null on any matching space
     for (auto* s : all_spaces_) {
       if (strategy.matches(*s)) {
-        auto r = s->make_reservation_or_null(bytes);
-        if (r) {
-          ++active_reservations_;
-          return r;
-        }
+        auto r = s->make_reservation_or_null(bytes, [this]() { --active_reservations_; });
+        if (r) { ++active_reservations_; }
+        return r;
       }
     }
     throw std::runtime_error("cuCascade: no memory space can satisfy reservation request");
@@ -142,7 +156,19 @@ class memory_reservation_manager {
   }
   virtual std::size_t get_active_reservation_count() const { return active_reservations_; }
 
-  virtual void shutdown() { spaces_.clear(); all_spaces_.clear(); tier_spaces_.clear(); }
+  virtual void shutdown() {
+    // Clear raw-pointer views before destroying the owning memory_space objects,
+    // otherwise subsequent access through get_all_memory_spaces() / get_memory_spaces_for_tier()
+    // would return dangling pointers.
+    all_spaces_.clear();
+    tier_spaces_.clear();
+    spaces_.clear();
+    // Reset the active-reservation counter: reservations are owned by Sirius
+    // (not by the manager), so destroying spaces_ above does not run their
+    // release callbacks. Reset here so the counter doesn't outlive the spaces
+    // it was counting against.
+    active_reservations_ = 0;
+  }
 
   virtual std::string get_name() const { return "cuCascade ROCm manager"; }
 

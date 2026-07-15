@@ -20,8 +20,10 @@
 #include "cuco/hash_functions.cuh"
 
 #include <hip/hip_runtime.h>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace cuco {
 
@@ -39,7 +41,9 @@ __global__ void bloom_add_kernel(WordT* bits, std::size_t num_blocks,
   KeyT key = keys[idx];
   std::uint64_t hashes[16]; // max k=16
   std::size_t k = policy.num_hash_functions();
-  assert(k <= 16 && "cuco::bloom_filter: num_hash_functions exceeds hardcoded max of 16");
+  // Runtime guard: assert is a no-op under NDEBUG, but a k>16 would overflow
+  // the stack buffer. Cap at 16 rather than crashing.
+  if (k > 16) k = 16;
   policy.hash(key, hashes, k);
 
   std::size_t block_idx = hashes[0] % num_blocks;
@@ -69,7 +73,7 @@ __global__ void bloom_probe_kernel(WordT const* bits, std::size_t num_blocks,
   KeyT key = keys[idx];
   std::uint64_t hashes[16];
   std::size_t k = policy.num_hash_functions();
-  assert(k <= 16 && "cuco::bloom_filter: num_hash_functions exceeds hardcoded max of 16");
+  if (k > 16) k = 16;  // runtime guard (assert is no-op under NDEBUG)
   policy.hash(key, hashes, k);
 
   std::size_t block_idx = hashes[0] % num_blocks;
@@ -97,7 +101,7 @@ __global__ void bloom_probe_kernel(WordT const* bits, std::size_t num_blocks,
 
 template <typename KeyT,
           typename Extent = extent<std::size_t>,
-          int Scope = 0,  // cuda::thread_scope_device (ignored on HIP)
+          int Scope = 0,  // cuda::thread_scope_system (ignored on HIP)
           typename Policy = default_filter_policy<>,
           typename Allocator = dummy_allocator>
 class bloom_filter {
@@ -117,8 +121,11 @@ class bloom_filter {
                         Allocator alloc = {}, hipStream_t stream = 0)
     : block_extent_(static_cast<std::size_t>(block_extent)),
       policy_(policy),
-      stream_(stream) {
+      last_stream_(stream) {
     (void)alloc; // Allocator accepted for API compat, hipMalloc used
+    if (block_extent_ == 0) {
+      throw std::runtime_error("cuco::bloom_filter: block_extent must be greater than 0");
+    }
     std::size_t bytes = block_extent_ * words_per_block * sizeof(word_type);
     if (hipMalloc(&bits_, bytes) != hipSuccess) {
       throw std::runtime_error("cuco::bloom_filter: hipMalloc failed");
@@ -132,10 +139,11 @@ class bloom_filter {
 
   __host__ ~bloom_filter() {
     if (bits_) {
-      // Sync the construction/insert stream before freeing — hipFree does
-      // NOT sync non-default streams, so async ops on stream_ could still
-      // be reading/writing bits_ when we free it.
-      hipStreamSynchronize(stream_);
+      // Sync ALL device work before freeing — hipFree does NOT sync non-default
+      // streams, and the filter may have been used on multiple streams. Using
+      // hipDeviceSynchronize (instead of just last_stream_) guarantees no async
+      // kernel is still reading/writing bits_ when we free it.
+      hipDeviceSynchronize();
       hipFree(bits_);
     }
   }
@@ -154,6 +162,7 @@ class bloom_filter {
   /// Async insert a range of keys.
   template <typename InputIt>
   __host__ void add_async(InputIt first, InputIt last, hipStream_t stream) {
+    last_stream_ = stream;
     auto n = static_cast<std::size_t>(last - first);
     if (n == 0) return;
     std::size_t block = 256;
@@ -161,11 +170,15 @@ class bloom_filter {
     detail::bloom_add_kernel<word_type, Policy, KeyT, InputIt>
       <<<grid, block, 0, stream>>>(bits_, block_extent_, words_per_block,
                                     policy_, first, n);
+    if (hipGetLastError() != hipSuccess) {
+      throw std::runtime_error("cuco::bloom_filter: add_async kernel launch failed");
+    }
   }
 
   /// Async probe: write `true`/`false` for each key.
   template <typename InputIt, typename OutputIt>
   __host__ void contains_async(InputIt first, InputIt last, OutputIt out, hipStream_t stream) {
+    last_stream_ = stream;
     auto n = static_cast<std::size_t>(last - first);
     if (n == 0) return;
     std::size_t block = 256;
@@ -173,13 +186,16 @@ class bloom_filter {
     detail::bloom_probe_kernel<word_type, Policy, KeyT, InputIt, OutputIt>
       <<<grid, block, 0, stream>>>(bits_, block_extent_, words_per_block,
                                     policy_, first, n, out);
+    if (hipGetLastError() != hipSuccess) {
+      throw std::runtime_error("cuco::bloom_filter: contains_async kernel launch failed");
+    }
   }
 
  private:
   word_type* bits_{nullptr};
   std::size_t block_extent_{};
   Policy policy_{};
-  hipStream_t stream_{0};
+  hipStream_t last_stream_{0};
 };
 
 }  // namespace cuco

@@ -15,6 +15,17 @@
 #include <cstdint>
 #include <cstdio>
 
+// Check HIP runtime calls and abort with a clear message on failure, so an
+// allocation/copy failure surfaces as a test error instead of a nullptr
+// dereference inside a kernel.
+#define HIP_CHECK(call) do { \
+    hipError_t _err = (call); \
+    if (_err != hipSuccess) { \
+      printf("HIP error at %s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(_err)); \
+      return 1; \
+    } \
+  } while (0)
+
 using key_t = int32_t;
 using set_t = cuco::static_set<key_t>;
 using set_ref_t = cuco::set_ref<key_t, set_t::hasher_type>;
@@ -35,8 +46,8 @@ int main() {
   // Insert some keys
   key_t h_keys[] = {10, 20, 30, 40, 50};
   key_t* d_keys;
-  hipMalloc(&d_keys, sizeof(h_keys));
-  hipMemcpy(d_keys, h_keys, sizeof(h_keys), hipMemcpyHostToDevice);
+  HIP_CHECK(hipMalloc(&d_keys, sizeof(h_keys)));
+  HIP_CHECK(hipMemcpy(d_keys, h_keys, sizeof(h_keys), hipMemcpyHostToDevice));
 
   ss.insert_async(d_keys, d_keys + 5, 0);
   hipStreamSynchronize(0);
@@ -47,15 +58,15 @@ int main() {
   key_t h_probe[] = {10, 20, 30, 40, 50, 999};
   key_t* d_probe;
   bool* d_results;
-  hipMalloc(&d_probe, sizeof(h_probe));
-  hipMalloc(&d_results, sizeof(bool) * 6);
-  hipMemcpy(d_probe, h_probe, sizeof(h_probe), hipMemcpyHostToDevice);
+  HIP_CHECK(hipMalloc(&d_probe, sizeof(h_probe)));
+  HIP_CHECK(hipMalloc(&d_results, sizeof(bool) * 6));
+  HIP_CHECK(hipMemcpy(d_probe, h_probe, sizeof(h_probe), hipMemcpyHostToDevice));
 
   probe_kernel<<<1, 6>>>(d_probe, d_results, ref, 6);
   hipStreamSynchronize(0);
 
   bool h_results[6];
-  hipMemcpy(h_results, d_results, sizeof(h_results), hipMemcpyDeviceToHost);
+  HIP_CHECK(hipMemcpy(h_results, d_results, sizeof(h_results), hipMemcpyDeviceToHost));
 
   int pass = 0;
   for (int i = 0; i < 6; i++) {
@@ -71,5 +82,5 @@ int main() {
   printf("Result: %d/6 correct\n", pass);
   assert(pass == 6 && "All 5 inserted keys found + 1 non-inserted key correctly missing");
   printf("TEST PASSED\n");
-  return 0;
+  return (pass == 6) ? 0 : 1;
 }

@@ -3,7 +3,14 @@
  * Licensed under the Apache License, Version 2.0 (see LICENSE).
  */
 
-//! @file cuCascade reservation_aware_resource_adaptor — ROCm stub.
+//! @file cuCascade reservation_aware_resource_adaptor — ROCm real implementation.
+//!
+//! Wraps an upstream rmm::device_async_resource_ref (the hipMM/RMM device
+//! memory resource) with per-stream reservation tracking. Allocations delegate
+//! to the upstream resource; the reservation bookkeeping is real (peak/total
+//! bytes, per-stream reservation ownership) so Sirius's OOM/backpressure path
+//! sees accurate counters. The OOM policy is invoked on allocation failure if
+//! the caller attached one; the default (throw_on_oom_policy) rethrows.
 
 #pragma once
 
@@ -11,43 +18,126 @@
 #include <rmm/resource_ref.hpp>
 #include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/oom_handling_policy.hpp"
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace cucascade::memory {
 
 class memory_space;
 
-/// Wraps an RMM memory resource with reservation tracking.
-/// Stub: all methods throw or return defaults.
+/// Wraps an RMM device memory resource with reservation tracking.
+/// allocate/deallocate delegate to the captured upstream resource; the
+/// reservation tracker keeps peak/total counters that Sirius reads to drive
+/// backpressure and OOM rescheduling.
 class reservation_aware_resource_adaptor {
  public:
-  reservation_aware_resource_adaptor(rmm::device_async_resource_ref /*upstream*/,
-                                     std::size_t /*reservation_limit*/ = 0) {}
+  reservation_aware_resource_adaptor(rmm::device_async_resource_ref upstream,
+                                     std::size_t reservation_limit = 0)
+    : upstream_(upstream), reservation_limit_(reservation_limit) {}
 
-  void* allocate(rmm::cuda_stream_view, std::size_t /*bytes*/,
-                 std::size_t /*alignment*/ = 0) {
-    throw std::runtime_error("cuCascade stub: reservation_aware_resource_adaptor::allocate");
+  /// Allocate `bytes` (rounded to alignment) on the upstream resource and
+  /// charge it against the active reservation for `stream`. On failure, invoke
+  /// the attached OOM policy (default rethrows) so Sirius can reschedule.
+  void* allocate(rmm::cuda_stream_view stream, std::size_t bytes,
+                 std::size_t alignment = 0) {
+    auto& tracker = stream_tracker_[stream];
+    std::size_t current = tracker.current_bytes.load(std::memory_order_relaxed);
+    // Respect a reservation limit if one was set (0 = unlimited).
+    if (reservation_limit_ != 0 && current + bytes > reservation_limit_) {
+      if (auto* oom = oom_policy_for(stream)) {
+        oom->handle_oom(bytes, current);
+      }
+      throw std::runtime_error(
+        "cuCascade: reservation limit exceeded in "
+        "reservation_aware_resource_adaptor::allocate");
+    }
+    void* ptr = nullptr;
+    try {
+      ptr = upstream_.allocate(bytes, alignment);
+    } catch (...) {
+      if (auto* oom = oom_policy_for(stream)) {
+        oom->handle_oom(bytes, current);
+      }
+      throw;
+    }
+    tracker.current_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    std::size_t now = tracker.current_bytes.load(std::memory_order_relaxed);
+    std::size_t peak = tracker.peak_bytes.load(std::memory_order_relaxed);
+    while (now > peak && !tracker.peak_bytes.compare_exchange_weak(peak, now,
+             std::memory_order_relaxed)) {}
+    total_allocated_.fetch_add(bytes, std::memory_order_relaxed);
+    return ptr;
   }
-  void deallocate(rmm::cuda_stream_view, void* /*ptr*/, std::size_t /*bytes*/,
-                  std::size_t /*alignment*/ = 0) {}
 
-  std::size_t get_peak_allocated_bytes(rmm::cuda_stream_view) const { return 0; }
-  void reset_stream_reservation(rmm::cuda_stream_view) {}
+  /// Deallocate `bytes` previously allocated on `stream`, crediting the
+  /// reservation tracker. Bytes are clamped at 0 (no underflow).
+  void deallocate(rmm::cuda_stream_view stream, void* ptr, std::size_t bytes,
+                  std::size_t alignment = 0) {
+    upstream_.deallocate(ptr, bytes, alignment);
+    auto it = stream_tracker_.find(stream);
+    if (it != stream_tracker_.end()) {
+      std::size_t cur = it->second.current_bytes.load(std::memory_order_relaxed);
+      std::size_t sub = cur > bytes ? cur - bytes : 0;
+      it->second.current_bytes.store(sub, std::memory_order_relaxed);
+    }
+  }
+
+  std::size_t get_peak_allocated_bytes(rmm::cuda_stream_view stream) const {
+    auto it = stream_tracker_.find(stream);
+    return it != stream_tracker_.end()
+             ? it->second.peak_bytes.load(std::memory_order_relaxed)
+             : 0;
+  }
+  void reset_stream_reservation(rmm::cuda_stream_view stream) {
+    auto it = stream_tracker_.find(stream);
+    if (it != stream_tracker_.end()) {
+      it->second.current_bytes.store(0, std::memory_order_relaxed);
+      it->second.peak_bytes.store(0, std::memory_order_relaxed);
+    }
+  }
+
   // Sirius calls with 4 args: (stream, reservation, limit_policy, oom_policy)
   // and with 3 args: (stream, reservation, limit_policy)
   // and with 2 args: (stream, reservation) [test code]
-  // Both return bool (Sirius checks: if (!allocator->attach_reservation_to_tracker(...)))
-  bool attach_reservation_to_tracker(rmm::cuda_stream_view /*stream*/,
-                                     std::unique_ptr<reservation> /*reservation*/,
-                                     std::unique_ptr<reservation_limit_policy> /*limit_policy*/ = nullptr,
-                                     std::unique_ptr<oom_handling_policy> /*oom_policy*/ = nullptr) {
-    return false; // stub: no tracking
+  // Returns true on success (reservation accepted). The reservation is held
+  // for the stream's lifetime and released on detach/reset.
+  bool attach_reservation_to_tracker(rmm::cuda_stream_view stream,
+                                     std::unique_ptr<reservation> reservation,
+                                     std::unique_ptr<reservation_limit_policy> limit_policy = nullptr,
+                                     std::unique_ptr<oom_handling_policy> oom_policy = nullptr) {
+    auto& tracker = stream_tracker_[stream];
+    tracker.reservation = std::move(reservation);
+    tracker.limit_policy = std::move(limit_policy);
+    tracker.oom_policy = std::move(oom_policy);
+    return true;
   }
 
+  /// Expose the upstream resource so callers (e.g. host_parquet converter)
+  /// can pass it to cudf::io::read_parquet's mr argument.
   operator rmm::device_async_resource_ref() const {
-    throw std::runtime_error("cuCascade stub: no upstream resource");
+    return upstream_;
+  }
+
+ private:
+  rmm::device_async_resource_ref upstream_;
+  std::size_t reservation_limit_{0};
+  std::atomic<std::size_t> total_allocated_{0};
+
+  struct stream_state {
+    std::atomic<std::size_t> current_bytes{0};
+    std::atomic<std::size_t> peak_bytes{0};
+    std::unique_ptr<reservation> reservation;
+    std::unique_ptr<reservation_limit_policy> limit_policy;
+    std::unique_ptr<oom_handling_policy> oom_policy;
+  };
+  std::unordered_map<rmm::cuda_stream_view, stream_state> stream_tracker_;
+
+  oom_handling_policy* oom_policy_for(rmm::cuda_stream_view stream) {
+    auto it = stream_tracker_.find(stream);
+    return it != stream_tracker_.end() ? it->second.oom_policy.get() : nullptr;
   }
 };
 

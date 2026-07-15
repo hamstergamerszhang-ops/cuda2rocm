@@ -68,7 +68,13 @@ class representation_converter_registry {
         std::string(typeid(source).name()) + " -> " + std::string(typeid(TargetType).name()));
     }
     auto result = it->second(source, target_space, stream);
-    return std::unique_ptr<TargetType>(dynamic_cast<TargetType*>(result.release()));
+    auto* typed = dynamic_cast<TargetType*>(result.get());
+    if (!typed) {
+      throw std::runtime_error("cuCascade: converter returned wrong type for " +
+        std::string(typeid(source).name()) + " -> " + std::string(typeid(TargetType).name()));
+    }
+    result.release();
+    return std::unique_ptr<TargetType>(typed);
   }
 
   std::unique_ptr<idata_representation> convert(idata_representation const& source,

@@ -16,6 +16,7 @@
 #include <hip/hip_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace cuco {
 
@@ -68,6 +69,24 @@ __global__ void set_insert_kernel(KeyT* slots, std::size_t capacity,
   }
 }
 
+template <typename KeyT, typename Hash, typename InputIt, typename OutputIt>
+__global__ void set_probe_kernel(KeyT const* slots, std::size_t capacity,
+                                   KeyT empty_key, Hash hash,
+                                   InputIt keys, std::size_t n, OutputIt out) {
+  std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+
+  KeyT key = keys[idx];
+  bool found = false;
+  for (std::size_t probe = 0; probe < capacity; ++probe) {
+    std::size_t slot_idx = hash(key, probe) % capacity;
+    KeyT slot = slots[slot_idx];
+    if (slot == key) { found = true; break; }
+    if (slot == empty_key) break;
+  }
+  out[idx] = found;
+}
+
 }  // namespace detail
 
 /// Lightweight view for probing (device-constructible).
@@ -86,6 +105,14 @@ struct set_ref {
       if (slot == empty_key) return false;
     }
     return false;
+  }
+
+  /// Alias matching the real cuco::static_set_ref API. Sirius calls
+  /// `set.contains(key)` inside device kernels
+  /// (sirius_dynamic_in_list_filter.cu); without this the ROCm port fails to
+  /// compile when SIRIUS_ENABLE_CUCO=ON.
+  __host__ __device__ bool contains(KeyT const& key) const {
+    return operator()(key);
   }
 };
 
@@ -107,26 +134,36 @@ class static_set {
                       int = {}, Allocator alloc = {}, hipStream_t stream = 0)
     : capacity_(static_cast<std::size_t>(capacity)),
       empty_key_(empty.value),
-      hash_{} {
+      hash_{},
+      last_stream_(stream) {
     (void)alloc; // Allocator accepted for API compat, hipMalloc used
+    if (capacity_ == 0) {
+      throw std::runtime_error("cuco::static_set: capacity must be greater than 0");
+    }
     std::size_t bytes = capacity_ * sizeof(KeyT);
     if (hipMalloc(&slots_, bytes) != hipSuccess) {
       throw std::runtime_error("cuco::static_set: hipMalloc failed");
     }
-    // Fill all slots with the empty key. Launch enough threads to cover
-    // the capacity — previously <<<1,1>>> only filled slot 0.
+    // Fill all slots with the empty key on the caller's stream. Launch enough
+    // threads to cover the capacity — previously <<<1,1>>> only filled slot 0.
     std::size_t block = 256;
     std::size_t grid = (capacity_ + block - 1) / block;
     if (grid == 0) grid = 1;
-    detail::fill_empty_key_kernel<KeyT><<<grid, block>>>(slots_, empty_key_, capacity_);
-    last_stream_ = 0;  // default stream for the fill kernel
+    detail::fill_empty_key_kernel<KeyT><<<grid, block, 0, stream>>>(slots_, empty_key_, capacity_);
+    if (hipGetLastError() != hipSuccess) {
+      hipFree(slots_);
+      slots_ = nullptr;
+      throw std::runtime_error("cuco::static_set: fill_empty_key_kernel launch failed");
+    }
   }
 
   __host__ ~static_set() {
     if (slots_) {
-      // Sync the last insert/fill stream before freeing — hipFree does NOT
-      // sync non-default streams.
-      hipStreamSynchronize(last_stream_);
+      // Sync ALL device work before freeing — hipFree does NOT sync non-default
+      // streams, and the set may have been used on multiple streams (insert on
+      // one, probe on another). hipDeviceSynchronize guarantees no async kernel
+      // is still accessing slots_ when we free it.
+      hipDeviceSynchronize();
       hipFree(slots_);
     }
   }
@@ -148,6 +185,22 @@ class static_set {
     std::size_t grid = (n + block - 1) / block;
     detail::set_insert_kernel<KeyT, Hash, InputIt>
       <<<grid, block, 0, stream>>>(slots_, capacity_, empty_key_, hash_, first, n);
+  }
+
+  /// Async probe: write `true`/`false` for each key. Tracks the stream so the
+  /// destructor can sync it before freeing slots_ (hipFree does NOT sync
+  /// non-default streams). Without this, a probe issued on a non-default
+  /// stream that is still in flight when the set is destroyed would read
+  /// freed memory.
+  template <typename InputIt, typename OutputIt>
+  __host__ void contains_async(InputIt first, InputIt last, OutputIt out, hipStream_t stream) {
+    last_stream_ = stream;
+    auto n = static_cast<std::size_t>(last - first);
+    if (n == 0) return;
+    std::size_t block = 256;
+    std::size_t grid = (n + block - 1) / block;
+    detail::set_probe_kernel<KeyT, Hash, InputIt, OutputIt>
+      <<<grid, block, 0, stream>>>(slots_, capacity_, empty_key_, hash_, first, n, out);
   }
 
   /// Returns a reference object for contains queries.

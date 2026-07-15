@@ -79,5 +79,10 @@ real implementations (not stubs) for the core subsystem:
 
 ## Status
 
-A compile-only stub exists in the Sirius fork at `cmake/rocm_compat/cucascade/`.
-This project will replace it with real implementations.
+A compile-only stub set is provided in this repo at
+`cucascade-rocm/include/cucascade/` (consumed by Sirius via FetchContent).
+7 of the 32 headers are real implementations (memory_space, stream_pool,
+topology_discovery, event, disk_access_limiter, representation_converter,
+reservation_manager_configurator); the remaining 25 throw at runtime
+(→ DuckDB CPU fallback). This project is replacing those stubs with real
+implementations.

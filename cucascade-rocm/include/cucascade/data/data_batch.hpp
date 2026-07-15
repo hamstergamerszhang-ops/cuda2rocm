@@ -12,6 +12,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -33,6 +34,7 @@ class read_only_data_batch {
     : data_(std::move(data)), space_(space), batch_id_(batch_id) {}
 
   idata_representation const* get_data() const { return data_.get(); }
+  std::shared_ptr<idata_representation> const& get_shared_data() const { return data_; }
   memory::memory_space* get_memory_space() const { return space_; }
   memory::Tier get_current_tier() const { return memory::Tier::GPU; }
   uint64_t get_batch_id() const { return batch_id_; }
@@ -71,6 +73,7 @@ class mutable_data_batch {
     : data_(std::move(data)), space_(space), batch_id_(batch_id) {}
 
   idata_representation const* get_data() const { return data_.get(); }
+  std::shared_ptr<idata_representation> const& get_shared_data() const { return data_; }
   memory::memory_space* get_memory_space() const { return space_; }
   uint64_t get_batch_id() const { return batch_id_; }
 
@@ -102,7 +105,10 @@ class mutable_data_batch {
   uint64_t batch_id_{0};
 };
 
-/// A data batch: owns a data representation with a lifecycle (idle → mutable → read-only).
+/// A data_batch owns a data representation and hands out shared read-only or
+/// mutable views of it. Converting between read-only and mutable views must
+/// preserve shared ownership of the underlying idata_representation; callers
+/// receive a new view that references the same object.
 class data_batch {
  public:
   static std::shared_ptr<data_batch> make(uint64_t batch_id,
@@ -129,6 +135,7 @@ class data_batch {
     state_ = batch_state::mutable_locked;
     return mutable_data_batch(data_, space_, batch_id_);
   }
+
   bool try_to_read_only() {
     if (state_ != batch_state::mutable_locked && state_ != batch_state::idle) return false;
     state_ = batch_state::read_only;
@@ -147,18 +154,14 @@ class data_batch {
     return std::move(mut);
   }
   static mutable_data_batch readonly_to_mutable(read_only_data_batch&& ro) {
-    auto data = ro.get_data();
     auto space = ro.get_memory_space();
     auto id = ro.get_batch_id();
-    return mutable_data_batch(std::shared_ptr<idata_representation>(
-      const_cast<idata_representation*>(data)), space, id);
+    return mutable_data_batch(ro.get_shared_data(), space, id);
   }
   static read_only_data_batch mutable_to_readonly(mutable_data_batch&& mut) {
-    auto data = mut.get_data();
     auto space = mut.get_memory_space();
     auto id = mut.get_batch_id();
-    return read_only_data_batch(std::shared_ptr<idata_representation>(
-      const_cast<idata_representation*>(data)), space, id);
+    return read_only_data_batch(mut.get_shared_data(), space, id);
   }
 
   void subscribe() { ++subscriber_count_; }

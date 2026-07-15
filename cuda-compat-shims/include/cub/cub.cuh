@@ -12,10 +12,12 @@
 //! @c cub:: symbols resolve to their hipCUB equivalents.
 //!
 //! @c cub::detail::warp_threads is a CUB internal constant (= 32 on NVIDIA).
-//! hipCUB/rocPRIM does not expose it. AMD wavefronts are 64 wide (gfx90a/
-//! gfx942/gfx950), so the shim defines it as 64. It must be defined in
-//! @c namespace hipcub::detail BEFORE the alias, because you cannot add
-//! members to a namespace through its alias in C++.
+//! hipCUB/rocPRIM does not expose it. AMD CDNA wavefronts are 64 wide (e.g.
+//! gfx90a/gfx942/gfx950), while RDNA uses 32-wide wavefronts. The shim derives
+//! the value from the compiler-provided target macro when available, falling
+//! back to 64 for CDNA. It must be defined in @c namespace hipcub::detail
+//! BEFORE the alias, because you cannot add members to a namespace through its
+//! alias in C++.
 //!
 //! Note: hipCUB's ShuffleUp/ShuffleIndex/ShuffleDown ignore the member_mask
 //! parameter (rocPRIM does not support masked shuffles). Sirius's FULL_MASK
@@ -32,7 +34,12 @@
 // the alias. You cannot add members through a namespace alias in C++.
 namespace hipcub {
 namespace detail {
-inline constexpr int warp_threads = 64;
+inline constexpr int warp_threads =
+#ifdef __AMDGCN_WAVEFRONT_SIZE__
+  __AMDGCN_WAVEFRONT_SIZE__;
+#else
+  64;
+#endif
 }  // namespace detail
 }  // namespace hipcub
 

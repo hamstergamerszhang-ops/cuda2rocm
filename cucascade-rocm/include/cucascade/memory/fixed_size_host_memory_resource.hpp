@@ -2,7 +2,8 @@
  * Copyright 2026, Sirius Contributors.
  * Licensed under the Apache License, Version 2.0 (see LICENSE).
  */
-//! @file cuCascade fixed_size_host_memory_resource — ROCm stub.
+//! @file cuCascade fixed_size_host_memory_resource — ROCm real implementation.
+//! Pinned host RAM pool backed by hipMallocHost / hipFreeHost.
 //! multiple_blocks_allocation is NESTED inside the class (Sirius references
 //! it as fixed_size_host_memory_resource::multiple_blocks_allocation).
 
@@ -12,15 +13,24 @@
 #include "cucascade/memory/notification_channel.hpp"
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
+#include <hip/hip_runtime_api.h>
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace cucascade::memory {
 
 /// Fixed-size-block host memory resource (pinned host RAM pool).
-/// Stub: allocate/deallocate throw.
+/// Allocations are backed by hipMallocHost (page-locked host memory) and freed
+/// with hipFreeHost. Block granularity is `block_size_`; requests are rounded
+/// up to the next block. Reservation tracking is real so Sirius's host-staging
+/// backpressure path sees accurate counters.
 class fixed_size_host_memory_resource {
  public:
   // Sirius accesses these as fixed_size_host_memory_resource::default_pool_size etc.
@@ -91,43 +101,169 @@ class fixed_size_host_memory_resource {
 
   using fixed_multiple_blocks_allocation = std::unique_ptr<multiple_blocks_allocation>;
 
-  fixed_size_host_memory_resource(int32_t /*device_id*/,
-                                  rmm::device_async_resource_ref /*upstream*/,
-                                  std::size_t /*mem_limit*/ = 0,
+  fixed_size_host_memory_resource(int32_t device_id,
+                                  rmm::device_async_resource_ref upstream,
+                                  std::size_t mem_limit = 0,
                                   std::size_t /*capacity*/ = 0,
-                                  std::size_t /*block_size*/ = default_block_size,
+                                  std::size_t block_size = default_block_size,
                                   std::size_t /*pool_size*/ = default_pool_size,
-                                  std::size_t /*initial_pools*/ = default_initial_number_pools) {}
+                                  std::size_t /*initial_pools*/ = default_initial_number_pools)
+    : device_id_(device_id),
+      upstream_(upstream),
+      mem_limit_(mem_limit),
+      block_size_(block_size == 0 ? default_block_size : block_size) {}
 
-  std::size_t get_block_size() const { return default_block_size; }
-  std::size_t get_available_memory() const { return 0; }
-  std::size_t get_free_blocks() const { return 0; }
-  std::size_t get_total_blocks() const { return 0; }
-  std::size_t get_total_allocated_bytes() const { return 0; }
-  std::size_t get_total_reserved_bytes() const { return 0; }
-  std::size_t get_active_reservation_count() const { return 0; }
-  std::size_t get_peak_total_allocated_bytes() const { return 0; }
+  std::size_t get_block_size() const { return block_size_; }
+  std::size_t get_available_memory() const {
+    std::size_t used = total_allocated_.load(std::memory_order_relaxed);
+    return mem_limit_ > used ? mem_limit_ - used : 0;
+  }
+  std::size_t get_free_blocks() const {
+    // Number of whole blocks that still fit in the remaining budget.
+    std::size_t avail = get_available_memory();
+    return avail / block_size_;
+  }
+  std::size_t get_total_blocks() const {
+    return total_allocated_.load(std::memory_order_relaxed) / block_size_;
+  }
+  std::size_t get_total_allocated_bytes() const {
+    return total_allocated_.load(std::memory_order_relaxed);
+  }
+  std::size_t get_total_reserved_bytes() const {
+    return reserved_bytes_.load(std::memory_order_relaxed);
+  }
+  std::size_t get_active_reservation_count() const {
+    return active_reservations_.load(std::memory_order_relaxed);
+  }
+  std::size_t get_peak_total_allocated_bytes() const {
+    return peak_allocated_.load(std::memory_order_relaxed);
+  }
 
-  std::unique_ptr<reservation> reserve(std::size_t /*bytes*/,
+  /// Reserve `bytes` of host capacity. Returns a reservation handle whose
+  /// release callback decrements the reserved/active counters.
+  std::unique_ptr<reservation> reserve(std::size_t bytes,
                                        notification_channel* /*notifier*/ = nullptr) {
-    throw std::runtime_error("cuCascade stub: fixed_size_host_memory_resource::reserve");
+    if (mem_limit_ != 0) {
+      std::size_t used = total_allocated_.load(std::memory_order_relaxed);
+      if (used + bytes > mem_limit_) {
+        throw std::runtime_error(
+          "cuCascade: fixed_size_host_memory_resource::reserve exceeds mem_limit");
+      }
+    }
+    reserved_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    active_reservations_.fetch_add(1, std::memory_order_relaxed);
+    // The reservation holds a pointer back to this resource so its release
+    // callback can decrement the counters. memory_space owns this resource
+    // for the engine's lifetime, so the raw pointer is safe.
+    auto* self = this;
+    auto on_release = [self, bytes]() {
+      self->reserved_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+      self->active_reservations_.fetch_sub(1, std::memory_order_relaxed);
+    };
+    auto arena = std::make_unique<reserved_arena_bytes>(bytes);
+    // Host-only reservations are not backed by a memory_space; create the
+    // reservation with a null space so tier()/device_id() return HOST/0 and
+    // get_memory_space() throws if called.
+    return reservation::create(std::move(arena), std::move(on_release));
   }
 
-  fixed_multiple_blocks_allocation allocate_multiple_blocks(std::size_t /*bytes*/,
+  /// Allocate `bytes` of pinned host memory, rounded up to block_size_.
+  fixed_multiple_blocks_allocation allocate_multiple_blocks(std::size_t bytes,
                                                             reservation* /*res*/ = nullptr) {
-    throw std::runtime_error("cuCascade stub: allocate_multiple_blocks");
+    if (bytes == 0) {
+      return std::make_unique<multiple_blocks_allocation>();
+    }
+    std::size_t n_blocks = (bytes + block_size_ - 1) / block_size_;
+    std::size_t alloc_bytes = n_blocks * block_size_;
+    void* ptr = nullptr;
+    hipError_t err = hipMallocHost(&ptr, alloc_bytes);
+    if (err != hipSuccess || ptr == nullptr) {
+      throw std::runtime_error(
+        std::string("cuCascade: hipMallocHost failed in "
+                    "fixed_size_host_memory_resource::allocate_multiple_blocks: ") +
+        hipGetErrorString(err));
+    }
+    std::memset(ptr, 0, alloc_bytes);
+    auto alloc = std::make_unique<multiple_blocks_allocation>();
+    alloc->blocks_.reserve(n_blocks);
+    for (std::size_t i = 0; i < n_blocks; ++i) {
+      alloc->blocks_.emplace_back(
+        static_cast<char*>(ptr) + i * block_size_, block_size_);
+    }
+    alloc->block_size_ = block_size_;
+    alloc->total_bytes_ = alloc_bytes;
+    total_allocated_.fetch_add(alloc_bytes, std::memory_order_relaxed);
+    std::size_t now = total_allocated_.load(std::memory_order_relaxed);
+    std::size_t peak = peak_allocated_.load(std::memory_order_relaxed);
+    while (now > peak && !peak_allocated_.compare_exchange_weak(peak, now,
+             std::memory_order_relaxed)) {}
+    // Track the raw pointer + size for deallocate_multiple_blocks.
+    live_allocs_[reinterpret_cast<uintptr_t>(alloc.get())] = {ptr, alloc_bytes};
+    return alloc;
   }
 
-  void* allocate(rmm::cuda_stream_view, std::size_t /*bytes*/,
-                 std::size_t /*alignment*/ = 0) {
-    throw std::runtime_error("cuCascade stub: host allocate");
+  void deallocate_multiple_blocks(fixed_multiple_blocks_allocation alloc) {
+    auto it = live_allocs_.find(reinterpret_cast<uintptr_t>(alloc.get()));
+    if (it != live_allocs_.end()) {
+      hipFreeHost(it->second.first);
+      total_allocated_.fetch_sub(it->second.second, std::memory_order_relaxed);
+      live_allocs_.erase(it);
+    }
+    alloc.reset();
   }
-  void deallocate(rmm::cuda_stream_view, void* /*ptr*/, std::size_t /*bytes*/,
-                  std::size_t /*alignment*/ = 0) {}
+
+  void* allocate(rmm::cuda_stream_view, std::size_t bytes,
+                 std::size_t /*alignment*/ = 0) {
+    if (bytes == 0) return nullptr;
+    void* ptr = nullptr;
+    hipError_t err = hipMallocHost(&ptr, bytes);
+    if (err != hipSuccess || ptr == nullptr) {
+      throw std::runtime_error(
+        std::string("cuCascade: hipMallocHost failed in "
+                    "fixed_size_host_memory_resource::allocate: ") +
+        hipGetErrorString(err));
+    }
+    total_allocated_.fetch_add(bytes, std::memory_order_relaxed);
+    std::size_t now = total_allocated_.load(std::memory_order_relaxed);
+    std::size_t peak = peak_allocated_.load(std::memory_order_relaxed);
+    while (now > peak && !peak_allocated_.compare_exchange_weak(peak, now,
+             std::memory_order_relaxed)) {}
+    return ptr;
+  }
+  void deallocate(rmm::cuda_stream_view, void* ptr, std::size_t bytes,
+                  std::size_t /*alignment*/ = 0) {
+    if (ptr) {
+      hipFreeHost(ptr);
+      total_allocated_.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+  }
 
   operator rmm::device_async_resource_ref() const {
-    throw std::runtime_error("cuCascade stub: no upstream host resource");
+    return upstream_;
   }
+
+ private:
+  int32_t device_id_{0};
+  rmm::device_async_resource_ref upstream_;
+  std::size_t mem_limit_{0};
+  std::size_t block_size_{default_block_size};
+  std::atomic<std::size_t> total_allocated_{0};
+  std::atomic<std::size_t> reserved_bytes_{0};
+  std::atomic<std::size_t> active_reservations_{0};
+  std::atomic<std::size_t> peak_allocated_{0};
+
+  /// Tracks live multiple_blocks_allocations so their backing hipMallocHost
+  /// pointer can be freed in deallocate_multiple_blocks (the allocation object
+  /// owns N logical blocks but one physical allocation).
+  std::unordered_map<uintptr_t, std::pair<void*, std::size_t>> live_allocs_;
+
+  /// reserved_arena impl that reports a byte count.
+  struct reserved_arena_bytes : reserved_arena {
+    explicit reserved_arena_bytes(std::size_t n) : bytes_(n) {}
+    std::size_t size() const override { return bytes_; }
+    void grow_by(std::size_t n) override { bytes_ += n; }
+    std::size_t bytes_{0};
+  };
 };
 
 }  // namespace cucascade::memory

@@ -4,6 +4,13 @@
 #   find_package(rocm-cuda-compat CONFIG REQUIRED)
 #   target_link_libraries(my-target PRIVATE rocm-cuda-compat::cuda-compat-shims)
 
+include(CMakeFindDependencyMacro)
+
+# cucascade-rocm headers include <rmm/...> and <cudf/...>. If those targets
+# were linked at build time, ensure they are found for consumers too.
+find_dependency(rmm CONFIG)
+find_dependency(cudf CONFIG)
+
 include("${CMAKE_CURRENT_LIST_DIR}/rocm-cuda-compat-targets.cmake")
 
 # Provide alias targets for convenience

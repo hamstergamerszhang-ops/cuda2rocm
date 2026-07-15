@@ -79,8 +79,9 @@ class topology_discovery {
       for (int j = 0; j < device_count; ++j) {
         if (j != i) {
           int can_access = 0;
-          hipDeviceCanAccessPeer(&can_access, i, j);
-          if (can_access) gpu.peer_devices.push_back(j);
+          if (hipDeviceCanAccessPeer(&can_access, i, j) == hipSuccess && can_access) {
+            gpu.peer_devices.push_back(j);
+          }
         }
       }
       topology_.gpus.push_back(std::move(gpu));

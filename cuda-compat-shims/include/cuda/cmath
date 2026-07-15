@@ -16,8 +16,10 @@
   #include <cstdint>
   namespace cuda {
   template <typename A, typename B>
-  __host__ __device__ constexpr auto ceil_div(A a, B b) -> decltype((a + b - 1) / b) {
-    return (a + b - 1) / b;
+  __host__ __device__ constexpr auto ceil_div(A a, B b) -> decltype(a / b) {
+    // Overflow-safe: (a + b - 1) / b can overflow when a is near SIZE_MAX.
+    // a/b + (a%b != 0) never overflows.
+    return a / b + (a % b != 0 ? 1 : 0);
   }
   }  // namespace cuda
 #endif
