@@ -18,9 +18,12 @@
 #include <rmm/resource_ref.hpp>
 #include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/oom_handling_policy.hpp"
+#include <hip/hip_runtime_api.h>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -58,6 +61,27 @@ class reservation_aware_resource_adaptor {
     try {
       ptr = upstream_.allocate(bytes, alignment);
     } catch (...) {
+      // OOM on device — try pinned host memory as fallback (spill-to-host).
+      // This allows queries to complete on GPUs with limited VRAM instead
+      // of crashing. The allocation is tracked as host-spilled so deallocate
+      // uses hipFreeHost instead of the upstream deallocator.
+      hipError_t err = hipMallocHost(&ptr, bytes);
+      if (err == hipSuccess && ptr != nullptr) {
+        std::lock_guard<std::mutex> lk(host_spill_mutex_);
+        host_spilled_[ptr] = bytes;
+        fprintf(stderr,
+          "[sirius] WARNING: GPU OOM — spilled %zu bytes to host memory "
+          "(total spilled: %zu allocations)\n",
+          bytes, host_spilled_.size());
+        tracker.current_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        std::size_t now = tracker.current_bytes.load(std::memory_order_relaxed);
+        std::size_t peak = tracker.peak_bytes.load(std::memory_order_relaxed);
+        while (now > peak && !tracker.peak_bytes.compare_exchange_weak(peak, now,
+                 std::memory_order_relaxed)) {}
+        total_allocated_.fetch_add(bytes, std::memory_order_relaxed);
+        return ptr;
+      }
+      // Host allocation also failed — invoke OOM policy and rethrow
       if (auto* oom = oom_policy_for(stream)) {
         oom->handle_oom(bytes, current);
       }
@@ -74,8 +98,27 @@ class reservation_aware_resource_adaptor {
 
   /// Deallocate `bytes` previously allocated on `stream`, crediting the
   /// reservation tracker. Bytes are clamped at 0 (no underflow).
+  /// If the allocation was host-spilled (OOM fallback), uses hipFreeHost.
   void deallocate(rmm::cuda_stream_view stream, void* ptr, std::size_t bytes,
                   std::size_t alignment = 0) {
+    // Check if this was a host-spilled allocation
+    {
+      std::lock_guard<std::mutex> lk(host_spill_mutex_);
+      auto it = host_spilled_.find(ptr);
+      if (it != host_spilled_.end()) {
+        hipFreeHost(ptr);
+        host_spilled_.erase(it);
+        auto tracker_it = stream_tracker_.find(stream);
+        if (tracker_it != stream_tracker_.end()) {
+          std::size_t cur = tracker_it->second.current_bytes.load(std::memory_order_relaxed);
+          std::size_t sub = cur > bytes ? cur - bytes : 0;
+          tracker_it->second.current_bytes.store(sub, std::memory_order_relaxed);
+        }
+        total_allocated_.fetch_sub(bytes, std::memory_order_relaxed);
+        return;
+      }
+    }
+    // Normal device allocation — delegate to upstream
     upstream_.deallocate(ptr, bytes, alignment);
     auto it = stream_tracker_.find(stream);
     if (it != stream_tracker_.end()) {
@@ -134,6 +177,11 @@ class reservation_aware_resource_adaptor {
     std::unique_ptr<oom_handling_policy> oom_policy;
   };
   std::unordered_map<rmm::cuda_stream_view, stream_state> stream_tracker_;
+
+  // Host-spilled allocations (OOM fallback): tracks ptr → bytes so
+  // deallocate knows to use hipFreeHost instead of upstream_.deallocate.
+  std::mutex host_spill_mutex_;
+  std::unordered_map<void*, std::size_t> host_spilled_;
 
   oom_handling_policy* oom_policy_for(rmm::cuda_stream_view stream) {
     auto it = stream_tracker_.find(stream);
