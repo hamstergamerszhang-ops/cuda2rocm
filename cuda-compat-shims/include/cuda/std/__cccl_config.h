@@ -17,9 +17,11 @@
 
 #pragma once
 
-// Try hipDF's real CCCL config first (if installed via cudf::cudf includes).
+// Try the real CCCL config first (if installed via hipDF/cudf::cudf includes).
+#ifdef __has_include_next
 #if __has_include_next(<cuda/std/__cccl_config.h>)
   #include_next <cuda/std/__cccl_config.h>
+#endif
 #endif
 
 // Fallback: define _CCCL_* macros only if not already defined by real CCCL.

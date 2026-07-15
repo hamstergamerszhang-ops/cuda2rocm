@@ -33,7 +33,7 @@ struct default_filter_policy {
   template <typename KeyT, typename OutputIt>
   __host__ __device__ void hash(KeyT const& key, OutputIt out, std::size_t k) const {
     std::uint64_t h1 = hash_(key);
-    std::uint64_t h2 = h1 >> 32;
+    std::uint64_t h2 = (h1 >> 32) | 1;  // ensure non-zero stride (guard against h2=0 degeneration)
     for (std::size_t i = 0; i < k; ++i) {
       out[i] = h1 + i * h2;
     }
@@ -58,8 +58,13 @@ struct arrow_filter_policy {
     xxhash_64<KeyT> h;
     std::uint64_t h1 = h(key);
     std::uint64_t h2 = h1 * 0x9E3779B97F4A7C15ULL;
+    // Block-aligned: words_per_block=8, word_type=uint32_t → 32-byte blocks.
+    // Shift by log2(32) = 5 to get a block index. (>> 6 would assume 64-byte
+    // blocks and leave half the filter's blocks unreachable, raising the
+    // false-positive rate.)
+    constexpr std::size_t block_shift = 5;
     for (std::size_t i = 0; i < k; ++i) {
-      out[i] = (h1 + i * h2) >> 6;  // block-aligned
+      out[i] = (h1 + i * h2) >> block_shift;
     }
   }
 };

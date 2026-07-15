@@ -24,8 +24,8 @@
 //!
 //! This shim, placed first on the include path when @c ENABLE_ROCM is ON,
 //! pulls in the HIP runtime and then @c #define's every @c cuda* symbol to its
-//! @c hip* equivalent. This mirrors what hipDF's own build infrastructure
-//! provides: hipDF keeps @c cuda* calls verbatim in its source and relies on
+//! @c hip* equivalent. This mirrors what hipify's own build infrastructure
+//! provides: HIP keeps @c cuda* calls verbatim in its source and relies on
 //! a compat layer at build time.
 //!
 //! @c CUDART_VERSION is defined as 0 so that @c #if CUDART_VERSION >= 12080
@@ -91,6 +91,12 @@ using cudaPointerAttributes = hipPointerAttribute_t;
 // ---------------------------------------------------------------------------
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventBlockingSync hipEventBlockingSync
+
+// ---------------------------------------------------------------------------
+// Stream flags
+// ---------------------------------------------------------------------------
+#define cudaStreamDefault hipStreamDefault
+#define cudaStreamNonBlocking hipStreamNonBlocking
 
 // ---------------------------------------------------------------------------
 // Host alloc flags

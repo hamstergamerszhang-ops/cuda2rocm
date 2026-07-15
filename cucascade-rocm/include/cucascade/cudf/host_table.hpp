@@ -12,6 +12,7 @@
 #include "cucascade/memory/common.hpp"
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace cucascade::memory {

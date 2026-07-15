@@ -16,9 +16,24 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include "cuda/__memory/aligned_size.h"
-#include <cstring>
 
 namespace cooperative_groups {
+
+namespace detail {
+
+/// Device-safe byte copy. A byte-by-byte loop is the most portable form across
+/// hip-clang versions (no reliance on __builtin_memcpy being available in
+/// device code, which was fragile). Sirius's shared_staging.cuh uses the same
+/// word-per-thread style in its manual fallback.
+__device__ inline void copy_bytes(void* dst, void const* src, std::size_t n) {
+  auto* d = static_cast<char*>(dst);
+  auto const* s = static_cast<char const*>(src);
+  for (std::size_t i = 0; i < n; ++i) {
+    d[i] = s[i];
+  }
+}
+
+}  // namespace detail
 
 /// Serial memcpy_async — copies n bytes from src to dst, one thread per block.
 /// This is a fallback; the real CUDA version uses cp.async hardware on Ampere+.
@@ -28,7 +43,7 @@ __device__ void memcpy_async(Group const& /*block*/, void* dst, void const* src,
                              ::cuda::aligned_size_t<0> n) {
   // Only thread 0 copies; others wait at the barrier.
   if (threadIdx.x == 0) {
-    __builtin_memcpy(dst, src, static_cast<std::size_t>(n));
+    detail::copy_bytes(dst, src, static_cast<std::size_t>(n));
   }
   __syncthreads();
 }
@@ -38,7 +53,7 @@ template <std::size_t Alignment, typename Group>
 __device__ void memcpy_async(Group const& /*block*/, void* dst, void const* src,
                              ::cuda::aligned_size_t<Alignment> n) {
   if (threadIdx.x == 0) {
-    __builtin_memcpy(dst, src, static_cast<std::size_t>(n));
+    detail::copy_bytes(dst, src, static_cast<std::size_t>(n));
   }
   __syncthreads();
 }

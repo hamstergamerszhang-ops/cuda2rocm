@@ -11,6 +11,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <utility>
 

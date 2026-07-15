@@ -82,29 +82,54 @@ class memory_space {
 
   // --- Memory tracking (real: tracks allocated/reserved bytes) ---
   std::size_t get_max_memory() const { return max_memory_; }
-  std::size_t get_available_memory() const { return max_memory_ - reserved_memory_; }
+  // Guard against unsigned underflow: if max_memory_ was never set (defaults
+  // to 0) or reserved exceeds max (shouldn't happen, but defensive), return 0
+  // instead of wrapping to a huge value. Without this, an uninitialized
+  // max_memory_=0 makes get_available_memory() return ~0ULL, so every
+  // reservation succeeds and the OOM/backpressure path is defeated.
+  std::size_t get_available_memory() const {
+    return max_memory_ > reserved_memory_ ? max_memory_ - reserved_memory_ : 0;
+  }
   std::size_t get_total_reserved_memory() const { return reserved_memory_; }
 
-  std::unique_ptr<reservation> make_reservation(std::size_t bytes) {
+  std::unique_ptr<reservation> make_reservation(
+    std::size_t bytes,
+    reservation::release_callback on_release = {}) {
     if (bytes > get_available_memory()) {
       throw std::runtime_error("cuCascade: insufficient memory for reservation");
     }
     reserved_memory_ += bytes;
     auto arena = std::make_unique<simple_arena>(bytes);
-    return reservation::create(*this, std::move(arena));
+    auto space_release = [this, bytes, cb = std::move(on_release)]() mutable {
+      release_reservation(bytes);
+      if (cb) cb();
+    };
+    return reservation::create(*this, std::move(arena), std::move(space_release));
   }
-  std::unique_ptr<reservation> make_reservation_or_null(std::size_t bytes) {
+  std::unique_ptr<reservation> make_reservation_or_null(
+    std::size_t bytes,
+    reservation::release_callback on_release = {}) {
     if (bytes > get_available_memory()) return nullptr;
     reserved_memory_ += bytes;
     auto arena = std::make_unique<simple_arena>(bytes);
-    return reservation::create(*this, std::move(arena));
+    auto space_release = [this, bytes, cb = std::move(on_release)]() mutable {
+      release_reservation(bytes);
+      if (cb) cb();
+    };
+    return reservation::create(*this, std::move(arena), std::move(space_release));
   }
-  std::unique_ptr<reservation> make_reservation_upto(std::size_t bytes) {
+  std::unique_ptr<reservation> make_reservation_upto(
+    std::size_t bytes,
+    reservation::release_callback on_release = {}) {
     std::size_t actual = std::min(bytes, get_available_memory());
     if (actual == 0) return nullptr;
     reserved_memory_ += actual;
     auto arena = std::make_unique<simple_arena>(actual);
-    return reservation::create(*this, std::move(arena));
+    auto space_release = [this, actual, cb = std::move(on_release)]() mutable {
+      release_reservation(actual);
+      if (cb) cb();
+    };
+    return reservation::create(*this, std::move(arena), std::move(space_release));
   }
 
   void release_reservation(std::size_t bytes) { if (reserved_memory_ >= bytes) reserved_memory_ -= bytes; }

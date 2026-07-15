@@ -67,7 +67,7 @@ class cuda_event {
   cudaError_t synchronize_no_throw() { return hipEventSynchronize(event_); }
   float elapsed_time(cuda_event const& start) const {
     float ms = 0.f;
-    hipEventElapsedTime(&ms, start.event_, event_);
+    CUCASCADE_CUDA_TRY(hipEventElapsedTime(&ms, start.event_, event_));
     return ms;
   }
   event::query_result query() const {
