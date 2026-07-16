@@ -61,11 +61,33 @@ class reservation_aware_resource_adaptor {
     try {
       ptr = upstream_.allocate(bytes, alignment);
     } catch (...) {
-      // OOM on device — try pinned host memory as fallback (spill-to-host).
-      // This allows queries to complete on GPUs with limited VRAM instead
-      // of crashing. The allocation is tracked as host-spilled so deallocate
-      // uses hipFreeHost instead of the upstream deallocator.
-      hipError_t err = hipMallocHost(&ptr, bytes);
+      // OOM cascade: device → UVM (managed memory) → pinned host
+      //
+      // Tier 1: hipMallocManaged (Unified Virtual Memory)
+      //   - GPU can access directly via page-fault migration
+      //   - Faster than host-staging for irregular access patterns
+      //   - Only available on AMD ROCm (hipMallocManaged)
+      hipError_t err = hipMallocManaged(&ptr, bytes);
+      if (err == hipSuccess && ptr != nullptr) {
+        std::lock_guard<std::mutex> lk(host_spill_mutex_);
+        host_spilled_[ptr] = bytes;  // tracked as "spilled" for dealloc
+        fprintf(stderr,
+          "[sirius] WARNING: GPU OOM — allocated %zu bytes via UVM "
+          "(managed memory, total spilled: %zu allocations)\n",
+          bytes, host_spilled_.size());
+        tracker.current_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        std::size_t now = tracker.current_bytes.load(std::memory_order_relaxed);
+        std::size_t peak = tracker.peak_bytes.load(std::memory_order_relaxed);
+        while (now > peak && !tracker.peak_bytes.compare_exchange_weak(peak, now,
+                 std::memory_order_relaxed)) {}
+        total_allocated_.fetch_add(bytes, std::memory_order_relaxed);
+        return ptr;
+      }
+
+      // Tier 2: hipMallocHost (pinned host memory)
+      //   - Slower than UVM (explicit D2H/H2D needed)
+      //   - Works on all platforms
+      err = hipMallocHost(&ptr, bytes);
       if (err == hipSuccess && ptr != nullptr) {
         std::lock_guard<std::mutex> lk(host_spill_mutex_);
         host_spilled_[ptr] = bytes;
@@ -81,7 +103,7 @@ class reservation_aware_resource_adaptor {
         total_allocated_.fetch_add(bytes, std::memory_order_relaxed);
         return ptr;
       }
-      // Host allocation also failed — invoke OOM policy and rethrow
+      // All tiers failed — invoke OOM policy and rethrow
       if (auto* oom = oom_policy_for(stream)) {
         oom->handle_oom(bytes, current);
       }
@@ -98,15 +120,21 @@ class reservation_aware_resource_adaptor {
 
   /// Deallocate `bytes` previously allocated on `stream`, crediting the
   /// reservation tracker. Bytes are clamped at 0 (no underflow).
-  /// If the allocation was host-spilled (OOM fallback), uses hipFreeHost.
+  /// If the allocation was spilled (OOM fallback), tries hipFree first (for
+  /// UVM/managed memory), then hipFreeHost (for pinned host memory).
   void deallocate(rmm::cuda_stream_view stream, void* ptr, std::size_t bytes,
                   std::size_t alignment = 0) {
-    // Check if this was a host-spilled allocation
+    // Check if this was a spilled allocation (UVM or host-pinned)
     {
       std::lock_guard<std::mutex> lk(host_spill_mutex_);
       auto it = host_spilled_.find(ptr);
       if (it != host_spilled_.end()) {
-        hipFreeHost(ptr);
+        // Try hipFree first (works for UVM/managed memory).
+        // If it fails, try hipFreeHost (for pinned host memory).
+        hipError_t err = hipFree(ptr);
+        if (err != hipSuccess) {
+          hipFreeHost(ptr);
+        }
         host_spilled_.erase(it);
         auto tracker_it = stream_tracker_.find(stream);
         if (tracker_it != stream_tracker_.end()) {
