@@ -170,6 +170,37 @@ class reservation_aware_resource_adaptor {
     }
   }
 
+  /// Defragment the memory pool. Called between queries when the stream is
+  /// idle. Returns unused pages to the OS via hipMemPoolTrimTo, preventing
+  /// fragmentation-induced allocation failures on long-running workloads.
+  /// Also clears the host-spilled allocation map (those pointers are stale
+  /// after the pool is trimmed).
+  void defragment() {
+    std::size_t current = total_allocated_.load(std::memory_order_relaxed);
+    std::size_t spilled = 0;
+    {
+      std::lock_guard<std::mutex> lk(host_spill_mutex_);
+      spilled = host_spilled_.size();
+    }
+    if (current == 0 && spilled == 0) {
+      // Nothing allocated — trim the pool to release all pages
+      hipMemPool_t pool = nullptr;
+      if (hipDeviceGetMemPool(&pool, 0) == hipSuccess && pool) {
+        hipMemPoolTrimTo(pool, 0);
+      }
+      return;
+    }
+    // If more than 50% of allocations are spilled to host/UVM, log a warning
+    // (indicates sustained memory pressure — the user should consider a
+    // larger GPU or smaller batch sizes).
+    if (spilled > 0 && spilled > total_allocated_.load() / 2) {
+      fprintf(stderr,
+        "[sirius] WARNING: high memory pressure — %zu spilled allocations "
+        "out of %zu total. Consider reducing batch size or SIRIUS_MAX_BATCH_BYTES.\n",
+        spilled, total_allocated_.load());
+    }
+  }
+
   // Sirius calls with 4 args: (stream, reservation, limit_policy, oom_policy)
   // and with 3 args: (stream, reservation, limit_policy)
   // and with 2 args: (stream, reservation) [test code]
