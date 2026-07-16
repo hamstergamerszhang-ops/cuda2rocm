@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -198,16 +199,30 @@ class fixed_size_host_memory_resource {
     while (now > peak && !peak_allocated_.compare_exchange_weak(peak, now,
              std::memory_order_relaxed)) {}
     // Track the raw pointer + size for deallocate_multiple_blocks.
-    live_allocs_[reinterpret_cast<uintptr_t>(alloc.get())] = {ptr, alloc_bytes};
+    {
+      std::lock_guard<std::mutex> lk(live_allocs_mutex_);
+      live_allocs_[reinterpret_cast<uintptr_t>(alloc.get())] = {ptr, alloc_bytes};
+    }
     return alloc;
   }
 
   void deallocate_multiple_blocks(fixed_multiple_blocks_allocation alloc) {
-    auto it = live_allocs_.find(reinterpret_cast<uintptr_t>(alloc.get()));
-    if (it != live_allocs_.end()) {
-      hipFreeHost(it->second.first);
-      total_allocated_.fetch_sub(it->second.second, std::memory_order_relaxed);
-      live_allocs_.erase(it);
+    void* ptr = nullptr;
+    std::size_t bytes = 0;
+    {
+      std::lock_guard<std::mutex> lk(live_allocs_mutex_);
+      auto it = live_allocs_.find(reinterpret_cast<uintptr_t>(alloc.get()));
+      if (it != live_allocs_.end()) {
+        ptr = it->second.first;
+        bytes = it->second.second;
+        live_allocs_.erase(it);
+      }
+    }
+    // Free outside the lock: hipFreeHost may block, and the map entry is
+    // already removed so no other thread can touch this allocation.
+    if (ptr) {
+      hipFreeHost(ptr);
+      total_allocated_.fetch_sub(bytes, std::memory_order_relaxed);
     }
     alloc.reset();
   }
@@ -252,6 +267,9 @@ class fixed_size_host_memory_resource {
   std::atomic<std::size_t> active_reservations_{0};
   std::atomic<std::size_t> peak_allocated_{0};
 
+  /// Guards live_allocs_ (written in allocate_multiple_blocks, read/erased in
+  /// deallocate_multiple_blocks — previously unlocked, a data race).
+  std::mutex live_allocs_mutex_;
   /// Tracks live multiple_blocks_allocations so their backing hipMallocHost
   /// pointer can be freed in deallocate_multiple_blocks (the allocation object
   /// owns N logical blocks but one physical allocation).

@@ -30,8 +30,28 @@ class borrowed_stream {
 
   borrowed_stream(borrowed_stream const&) = delete;
   borrowed_stream& operator=(borrowed_stream const&) = delete;
-  borrowed_stream(borrowed_stream&&) noexcept = default;
-  borrowed_stream& operator=(borrowed_stream&&) noexcept = default;
+
+  // Custom move ctor/assignment: the members are raw pointers/sizes, so the
+  // defaulted moves would leave both source and target holding the same
+  // pool_/index_, and both destructors would call release() → double return.
+  // Null out the source after moving so only the target owns the stream.
+  borrowed_stream(borrowed_stream&& other) noexcept
+    : view_(other.view_), index_(other.index_), pool_(other.pool_) {
+    other.pool_ = nullptr;
+    other.index_ = static_cast<std::size_t>(-1);
+  }
+
+  borrowed_stream& operator=(borrowed_stream&& other) noexcept {
+    if (this != &other) {
+      release();  // relinquish the stream this wrapper currently holds
+      view_ = other.view_;
+      index_ = other.index_;
+      pool_ = other.pool_;
+      other.pool_ = nullptr;
+      other.index_ = static_cast<std::size_t>(-1);
+    }
+    return *this;
+  }
 
   ~borrowed_stream() { release(); }
 
