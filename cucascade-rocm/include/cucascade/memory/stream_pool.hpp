@@ -12,6 +12,7 @@
 #include <rmm/cuda_device.hpp>
 #include <cuda_runtime.h>  // shim → hip runtime
 #include <cstddef>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -111,6 +112,11 @@ class exclusive_stream_pool {
   }
 
   borrowed_stream acquire_stream(stream_acquire_policy policy = stream_acquire_policy::GROW) {
+    // Guard ALL access to streams_/free_: concurrent acquire/return mutating
+    // the vectors without a lock was a data race (push_back can reallocate
+    // and dangle iterators/views held by another thread, and concurrent
+    // free_[i] writes race).
+    std::lock_guard<std::mutex> lk(pool_mutex_);
     // Try to find a free stream
     for (std::size_t i = 0; i < free_.size(); ++i) {
       if (free_[i]) {
@@ -134,10 +140,14 @@ class exclusive_stream_pool {
   }
 
   void return_stream(std::size_t index) {
+    std::lock_guard<std::mutex> lk(pool_mutex_);
     if (index < free_.size()) { free_[index] = true; }
   }
 
-  std::size_t size() const { return streams_.size(); }
+  std::size_t size() const {
+    std::lock_guard<std::mutex> lk(pool_mutex_);
+    return streams_.size();
+  }
   rmm::cuda_device_id get_device_id() const { return device_id_; }
 
  private:
@@ -146,6 +156,8 @@ class exclusive_stream_pool {
   rmm::cuda_stream::flags flags_{};
   std::vector<hipStream_t> streams_;
   std::vector<bool> free_;
+  // mutable: size() is const but must lock to read streams_ safely.
+  mutable std::mutex pool_mutex_;
 };
 
 inline void borrowed_stream::release() noexcept {

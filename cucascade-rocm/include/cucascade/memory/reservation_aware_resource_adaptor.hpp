@@ -39,7 +39,16 @@ class reservation_aware_resource_adaptor {
  public:
   reservation_aware_resource_adaptor(rmm::device_async_resource_ref upstream,
                                      std::size_t reservation_limit = 0)
-    : upstream_(upstream), reservation_limit_(reservation_limit) {}
+    : upstream_(upstream), reservation_limit_(reservation_limit) {
+    // Capture the currently-active HIP device so defragment() targets the
+    // correct device's memory pool instead of hardcoding device 0 (wrong on
+    // multi-GPU systems). Querying here avoids changing the ctor signature
+    // (which external callers use positionally).
+    int dev = 0;
+    if (hipGetDevice(&dev) == hipSuccess) {
+      device_id_ = dev;
+    }
+  }
 
   /// Allocate `bytes` (rounded to alignment) on the upstream resource and
   /// charge it against the active reservation for `stream`. On failure, invoke
@@ -57,12 +66,30 @@ class reservation_aware_resource_adaptor {
     }
     // Respect a reservation limit if one was set (0 = unlimited).
     if (reservation_limit_ != 0 && current + bytes > reservation_limit_) {
-      if (auto* oom = oom_policy_for(stream)) {
-        oom->handle_oom(bytes, current);
+      std::exception_ptr eptr;
+      try {
+        throw std::runtime_error(
+          "cuCascade: reservation limit exceeded in "
+          "reservation_aware_resource_adaptor::allocate");
+      } catch (...) {
+        eptr = std::current_exception();
       }
-      throw std::runtime_error(
-        "cuCascade: reservation limit exceeded in "
-        "reservation_aware_resource_adaptor::allocate");
+      oom_handling_policy::RetryFunc retry =
+        [this](std::size_t b, rmm::cuda_stream_view) { return upstream_.allocate(b, 0); };
+      // Invoke handle_oom INSIDE the lock: oom_policy_for() previously
+      // returned a raw pointer into stream_tracker_ and released the lock, so
+      // a concurrent attach/erase could destroy the policy before this call
+      // ran (use-after-free). Also use the correct 4-arg signature
+      // (requested_bytes, stream, eptr, retry) — the old call passed
+      // (bytes, current), which did not match handle_oom's signature.
+      {
+        std::lock_guard<std::mutex> lk(tracker_mutex_);
+        auto it = stream_tracker_.find(stream);
+        if (it != stream_tracker_.end() && it->second.oom_policy) {
+          it->second.oom_policy->handle_oom(bytes, stream, eptr, retry);
+        }
+      }
+      std::rethrow_exception(eptr);
     }
     void* ptr = nullptr;
     try {
@@ -77,7 +104,7 @@ class reservation_aware_resource_adaptor {
       hipError_t err = hipMallocManaged(&ptr, bytes);
       if (err == hipSuccess && ptr != nullptr) {
         std::lock_guard<std::mutex> lk(tracker_mutex_);
-        host_spilled_[ptr] = bytes;  // tracked as "spilled" for dealloc
+        host_spilled_[ptr] = {bytes, /*is_uvm=*/true};  // UVM/managed: hipFree
         fprintf(stderr,
           "[sirius] WARNING: GPU OOM — allocated %zu bytes via UVM "
           "(managed memory, total spilled: %zu allocations)\n",
@@ -98,7 +125,7 @@ class reservation_aware_resource_adaptor {
       err = hipMallocHost(&ptr, bytes);
       if (err == hipSuccess && ptr != nullptr) {
         std::lock_guard<std::mutex> lk(tracker_mutex_);
-        host_spilled_[ptr] = bytes;
+        host_spilled_[ptr] = {bytes, /*is_uvm=*/false};  // host-pinned: hipFreeHost
         fprintf(stderr,
           "[sirius] WARNING: GPU OOM — spilled %zu bytes to host memory "
           "(total spilled: %zu allocations)\n",
@@ -113,8 +140,16 @@ class reservation_aware_resource_adaptor {
         return ptr;
       }
       // All tiers failed — invoke OOM policy and rethrow
-      if (auto* oom = oom_policy_for(stream)) {
-        oom->handle_oom(bytes, current);
+      // Invoke handle_oom INSIDE the lock (same reason as the
+      // reservation-limit path above) and with the correct 4-arg signature.
+      {
+        std::lock_guard<std::mutex> lk(tracker_mutex_);
+        auto it = stream_tracker_.find(stream);
+        if (it != stream_tracker_.end() && it->second.oom_policy) {
+          oom_handling_policy::RetryFunc retry =
+            [this](std::size_t b, rmm::cuda_stream_view) { return upstream_.allocate(b, 0); };
+          it->second.oom_policy->handle_oom(bytes, stream, std::current_exception(), retry);
+        }
       }
       throw;
     }
@@ -133,8 +168,9 @@ class reservation_aware_resource_adaptor {
 
   /// Deallocate `bytes` previously allocated on `stream`, crediting the
   /// reservation tracker. Bytes are clamped at 0 (no underflow).
-  /// If the allocation was spilled (OOM fallback), tries hipFree first (for
-  /// UVM/managed memory), then hipFreeHost (for pinned host memory).
+  /// If the allocation was spilled (OOM fallback), frees it with the function
+  /// matching the spill tier recorded at allocate time: hipFree for
+  /// UVM/managed memory, hipFreeHost for pinned host memory.
   void deallocate(rmm::cuda_stream_view stream, void* ptr, std::size_t bytes,
                   std::size_t alignment = 0) {
     // Check if this was a spilled allocation (UVM or host-pinned)
@@ -142,10 +178,14 @@ class reservation_aware_resource_adaptor {
       std::lock_guard<std::mutex> lk(tracker_mutex_);
       auto it = host_spilled_.find(ptr);
       if (it != host_spilled_.end()) {
-        // Try hipFree first (works for UVM/managed memory).
-        // If it fails, try hipFreeHost (for pinned host memory).
-        hipError_t err = hipFree(ptr);
-        if (err != hipSuccess) {
+        // Free with the function matching the tier that produced the
+        // pointer: hipFree for UVM/managed (hipMallocManaged), hipFreeHost
+        // for pinned host memory (hipMallocHost). Guessing (try hipFree then
+        // hipFreeHost) is wrong — hipFree on a host-pinned pointer returns an
+        // error without freeing, and hipFreeHost on UVM memory is invalid.
+        if (it->second.is_uvm) {
+          hipFree(ptr);
+        } else {
           hipFreeHost(ptr);
         }
         host_spilled_.erase(it);
@@ -205,7 +245,7 @@ class reservation_aware_resource_adaptor {
     // — so it is safe (and useful) to call on the active path, not only when
     // the pool is fully drained.
     hipMemPool_t pool = nullptr;
-    if (hipDeviceGetMemPool(&pool, 0) == hipSuccess && pool) {
+    if (hipDeviceGetMemPool(&pool, device_id_) == hipSuccess && pool) {
       hipMemPoolTrimTo(pool, 0);
     }
     // If many allocations are spilled to host/UVM, log a warning (indicates
@@ -248,6 +288,7 @@ class reservation_aware_resource_adaptor {
  private:
   rmm::device_async_resource_ref upstream_;
   std::size_t reservation_limit_{0};
+  int device_id_{0};  // captured in the ctor for defragment()'s hipDeviceGetMemPool
   std::atomic<std::size_t> total_allocated_{0};
 
   struct stream_state {
@@ -259,21 +300,21 @@ class reservation_aware_resource_adaptor {
   };
   std::unordered_map<rmm::cuda_stream_view, stream_state> stream_tracker_;
 
-  // Host-spilled allocations (OOM fallback): tracks ptr → bytes so
-  // deallocate knows to use hipFreeHost instead of upstream_.deallocate.
   // tracker_mutex_ guards ALL access to both stream_tracker_ and
   // host_spilled_ (stream_tracker_ was previously unlocked — a data race,
   // since a concurrent insert could rehash the map and dangle the
   // references/iterators held across allocate/deallocate). mutable so the
   // const get_peak_allocated_bytes() can lock it.
   mutable std::mutex tracker_mutex_;
-  std::unordered_map<void*, std::size_t> host_spilled_;
 
-  oom_handling_policy* oom_policy_for(rmm::cuda_stream_view stream) {
-    std::lock_guard<std::mutex> lk(tracker_mutex_);
-    auto it = stream_tracker_.find(stream);
-    return it != stream_tracker_.end() ? it->second.oom_policy.get() : nullptr;
-  }
+  // Host-spilled allocations (OOM fallback): tracks ptr -> {bytes, tier} so
+  // deallocate knows the correct free function: hipFree for UVM/managed
+  // (hipMallocManaged), hipFreeHost for pinned host memory (hipMallocHost).
+  struct spilled_alloc {
+    std::size_t bytes;
+    bool is_uvm;  // true = UVM/managed (hipFree), false = host-pinned (hipFreeHost)
+  };
+  std::unordered_map<void*, spilled_alloc> host_spilled_;
 };
 
 }  // namespace cucascade::memory

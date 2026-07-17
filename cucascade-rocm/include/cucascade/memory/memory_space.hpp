@@ -39,13 +39,24 @@ class memory_space {
   int32_t get_device_id() const { return device_id_; }
   rmm::device_async_resource_ref get_default_allocator() const { return allocator_; }
 
-  rmm::cuda_stream_view acquire_stream() {
+  // Returns a borrowed_stream (RAII) rather than a cuda_stream_view. The old
+  // return-by-value of cuda_stream_view destroyed the borrowed_stream
+  // temporary at the end of the full expression — its destructor called
+  // release(), returning the stream to the pool immediately, so the caller
+  // held a view to an already-released stream. Returning the borrowed_stream
+  // keeps it alive for the caller's scope; it still implicitly converts to
+  // cuda_stream_view where a view is needed.
+  borrowed_stream acquire_stream() {
     if (!streams_) throw std::runtime_error("cuCascade: no stream pool");
     return streams_->acquire_stream(stream_acquire_policy::GROW);
   }
-  rmm::cuda_stream_view acquire_stream() const {
+  borrowed_stream acquire_stream() const {
     if (streams_) return streams_->acquire_stream(stream_acquire_policy::GROW);
-    return rmm::cuda_stream_per_thread;
+    // No pool: wrap the per-thread stream in a non-owning borrowed_stream
+    // (pool_ == nullptr) so release() is a no-op and the stream is not
+    // returned to a pool that doesn't exist.
+    return borrowed_stream{rmm::cuda_stream_per_thread,
+                           static_cast<std::size_t>(-1), nullptr};
   }
 
   bool should_downgrade_memory() const { return false; }
@@ -82,7 +93,7 @@ class memory_space {
   }
 
   // --- Memory tracking (real: tracks allocated/reserved bytes) ---
-  std::size_t get_max_memory() const { return max_memory_; }
+  std::size_t get_max_memory() const { return max_memory_.load(std::memory_order_relaxed); }
   // Guard against unsigned underflow: if max_memory_ was never set (defaults
   // to 0) or reserved exceeds max (shouldn't happen, but defensive), return 0
   // instead of wrapping to a huge value. Without this, an uninitialized
@@ -90,17 +101,31 @@ class memory_space {
   // reservation succeeds and the OOM/backpressure path is defeated.
   std::size_t get_available_memory() const {
     std::size_t reserved = reserved_memory_.load(std::memory_order_relaxed);
-    return max_memory_ > reserved ? max_memory_ - reserved : 0;
+    std::size_t max = max_memory_.load(std::memory_order_relaxed);
+    return max > reserved ? max - reserved : 0;
   }
   std::size_t get_total_reserved_memory() const { return reserved_memory_.load(std::memory_order_relaxed); }
 
   std::unique_ptr<reservation> make_reservation(
     std::size_t bytes,
     reservation::release_callback on_release = {}) {
-    if (bytes > get_available_memory()) {
-      throw std::runtime_error("cuCascade: insufficient memory for reservation");
+    // CAS loop: atomically check available capacity AND charge the reservation
+    // in one step. The old check-then-act (read get_available_memory(), then
+    // fetch_add) let two threads both pass the check and both charge,
+    // oversubscribing past max_memory_.
+    std::size_t cur = reserved_memory_.load(std::memory_order_relaxed);
+    while (true) {
+      std::size_t max = max_memory_.load(std::memory_order_relaxed);
+      std::size_t avail = max > cur ? max - cur : 0;
+      if (bytes > avail) {
+        throw std::runtime_error("cuCascade: insufficient memory for reservation");
+      }
+      if (reserved_memory_.compare_exchange_weak(cur, cur + bytes,
+              std::memory_order_relaxed)) {
+        break;
+      }
+      // cur reloaded by the failed CAS; retry with the new value.
     }
-    reserved_memory_.fetch_add(bytes, std::memory_order_relaxed);
     auto arena = std::make_unique<simple_arena>(bytes);
     auto space_release = [this, bytes, cb = std::move(on_release)]() mutable {
       release_reservation(bytes);
@@ -111,8 +136,18 @@ class memory_space {
   std::unique_ptr<reservation> make_reservation_or_null(
     std::size_t bytes,
     reservation::release_callback on_release = {}) {
-    if (bytes > get_available_memory()) return nullptr;
-    reserved_memory_.fetch_add(bytes, std::memory_order_relaxed);
+    // Same CAS-loop fix as make_reservation, but returns nullptr instead of
+    // throwing on insufficient capacity.
+    std::size_t cur = reserved_memory_.load(std::memory_order_relaxed);
+    while (true) {
+      std::size_t max = max_memory_.load(std::memory_order_relaxed);
+      std::size_t avail = max > cur ? max - cur : 0;
+      if (bytes > avail) return nullptr;
+      if (reserved_memory_.compare_exchange_weak(cur, cur + bytes,
+              std::memory_order_relaxed)) {
+        break;
+      }
+    }
     auto arena = std::make_unique<simple_arena>(bytes);
     auto space_release = [this, bytes, cb = std::move(on_release)]() mutable {
       release_reservation(bytes);
@@ -123,9 +158,20 @@ class memory_space {
   std::unique_ptr<reservation> make_reservation_upto(
     std::size_t bytes,
     reservation::release_callback on_release = {}) {
-    std::size_t actual = std::min(bytes, get_available_memory());
-    if (actual == 0) return nullptr;
-    reserved_memory_.fetch_add(actual, std::memory_order_relaxed);
+    // CAS loop: reserve as much as fits (up to `bytes`) in one atomic step.
+    // Reading avail then fetch_add separately could race and over/under-charge.
+    std::size_t cur = reserved_memory_.load(std::memory_order_relaxed);
+    std::size_t actual = 0;
+    while (true) {
+      std::size_t max = max_memory_.load(std::memory_order_relaxed);
+      std::size_t avail = max > cur ? max - cur : 0;
+      actual = std::min(bytes, avail);
+      if (actual == 0) return nullptr;
+      if (reserved_memory_.compare_exchange_weak(cur, cur + actual,
+              std::memory_order_relaxed)) {
+        break;
+      }
+    }
     auto arena = std::make_unique<simple_arena>(actual);
     auto space_release = [this, actual, cb = std::move(on_release)]() mutable {
       release_reservation(actual);
@@ -144,7 +190,7 @@ class memory_space {
   }
 
   // --- Setters (used by memory_reservation_manager during construction) ---
-  void set_max_memory(std::size_t bytes) { max_memory_ = bytes; }
+  void set_max_memory(std::size_t bytes) { max_memory_.store(bytes, std::memory_order_relaxed); }
   void set_gpu_resource(std::unique_ptr<reservation_aware_resource_adaptor> res) {
     gpu_resource_ = std::move(res);
   }
@@ -157,7 +203,11 @@ class memory_space {
   int32_t device_id_;
   rmm::device_async_resource_ref allocator_;
   std::shared_ptr<exclusive_stream_pool> streams_;
-  std::size_t max_memory_{0};
+  // max_memory_ is atomic: it is read by get_available_memory() (the
+  // reservation admission check) on the hot allocation path and written by
+  // set_max_memory() during setup. A plain std::size_t would race when one
+  // thread reserves while another (re)configures the limit.
+  std::atomic<std::size_t> max_memory_{0};
   std::atomic<std::size_t> reserved_memory_{0};
 
   // Stored resources — one per tier. get_memory_resource_as<T>() returns
