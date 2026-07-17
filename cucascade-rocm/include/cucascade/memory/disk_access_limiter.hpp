@@ -28,7 +28,16 @@ class disk_access_limiter {
   }
 
   void release() {
-    current_.fetch_sub(1, std::memory_order_release);
+    // CAS loop with an underflow guard: only decrement when current_ > 0.
+    // The old fetch_sub(1) unconditionally subtracted, so a release() without
+    // a matching successful acquire() (or a double release) wrapped the
+    // unsigned counter to ~0ULL, after which try_acquire() would never
+    // succeed again (current_ >> max_), deadlocking disk access.
+    std::size_t cur = current_.load(std::memory_order_relaxed);
+    while (cur > 0 &&
+           !current_.compare_exchange_weak(cur, cur - 1,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed)) {}
   }
 
  private:

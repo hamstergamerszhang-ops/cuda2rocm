@@ -14,6 +14,7 @@
 #include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/memory_space.hpp"
 #include <rmm/cuda_stream.hpp>
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <map>
@@ -128,16 +129,29 @@ class memory_reservation_manager {
     // Find a matching space with available memory
     for (auto* s : all_spaces_) {
       if (strategy.matches(*s) && s->get_available_memory() >= bytes) {
-        auto r = s->make_reservation(bytes, [this]() { --active_reservations_; });
-        ++active_reservations_;
+        // Capture the shutdown flag by value (shared_ptr copy) so the callback
+        // can run after this manager is destroyed without dereferencing a
+        // dangling `this`: reservations are owned by Sirius, so a release
+        // callback may fire post-shutdown. The flag check (on the shared_ptr,
+        // not through `this`) gates the counter decrement.
+        auto flag = shutdown_flag_;
+        auto r = s->make_reservation(bytes, [this, flag]() {
+          if (flag->load(std::memory_order_acquire)) return;
+          active_reservations_.fetch_sub(1, std::memory_order_relaxed);
+        });
+        active_reservations_.fetch_add(1, std::memory_order_relaxed);
         return r;
       }
     }
     // Try make_reservation_or_null on any matching space
     for (auto* s : all_spaces_) {
       if (strategy.matches(*s)) {
-        auto r = s->make_reservation_or_null(bytes, [this]() { --active_reservations_; });
-        if (r) { ++active_reservations_; }
+        auto flag = shutdown_flag_;
+        auto r = s->make_reservation_or_null(bytes, [this, flag]() {
+          if (flag->load(std::memory_order_acquire)) return;
+          active_reservations_.fetch_sub(1, std::memory_order_relaxed);
+        });
+        if (r) { active_reservations_.fetch_add(1, std::memory_order_relaxed); }
         return r;
       }
     }
@@ -154,7 +168,7 @@ class memory_reservation_manager {
     for (auto const& s : spaces_) total += s->get_total_reserved_memory();
     return total;
   }
-  virtual std::size_t get_active_reservation_count() const { return active_reservations_; }
+  virtual std::size_t get_active_reservation_count() const { return active_reservations_.load(std::memory_order_relaxed); }
 
   virtual void shutdown() {
     // Clear raw-pointer views before destroying the owning memory_space objects,
@@ -163,11 +177,17 @@ class memory_reservation_manager {
     all_spaces_.clear();
     tier_spaces_.clear();
     spaces_.clear();
+    // Signal outstanding release callbacks (attached to Sirius-held
+    // reservations) to become no-ops: after shutdown they must not decrement
+    // the counter through `this`. The flag is held via shared_ptr so it (and
+    // the callback's check) survive destruction of this manager object.
+    shutdown_flag_->store(true, std::memory_order_release);
     // Reset the active-reservation counter: reservations are owned by Sirius
     // (not by the manager), so destroying spaces_ above does not run their
     // release callbacks. Reset here so the counter doesn't outlive the spaces
-    // it was counting against.
-    active_reservations_ = 0;
+    // it was counting against. Atomic store (was a racy non-atomic write that
+    // could race with a concurrent callback's decrement).
+    active_reservations_.store(0, std::memory_order_relaxed);
   }
 
   virtual std::string get_name() const { return "cuCascade ROCm manager"; }
@@ -176,7 +196,13 @@ class memory_reservation_manager {
   std::vector<std::unique_ptr<memory_space>> spaces_;
   std::vector<memory_space*> all_spaces_;
   std::map<Tier, std::vector<memory_space*>> tier_spaces_;
-  std::size_t active_reservations_{0};
+  // Atomic: incremented on reservation, decremented by the release callback,
+  // and reset by shutdown() — all potentially concurrent.
+  std::atomic<std::size_t> active_reservations_{0};
+  // shared_ptr so release callbacks (which capture a copy) can read the flag
+  // after this manager is destroyed without dereferencing a dangling `this`.
+  // Set to true in shutdown() so late callbacks become no-ops.
+  std::shared_ptr<std::atomic<bool>> shutdown_flag_{std::make_shared<std::atomic<bool>>(false)};
 };
 
 }  // namespace cucascade::memory

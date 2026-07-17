@@ -145,13 +145,40 @@ class fixed_size_host_memory_resource {
   std::unique_ptr<reservation> reserve(std::size_t bytes,
                                        notification_channel* /*notifier*/ = nullptr) {
     if (mem_limit_ != 0) {
-      std::size_t used = total_allocated_.load(std::memory_order_relaxed);
-      if (used + bytes > mem_limit_) {
-        throw std::runtime_error(
-          "cuCascade: fixed_size_host_memory_resource::reserve exceeds mem_limit");
+      // CAS loop: atomically check capacity AND charge reserved_bytes_ in one
+      // step. The old read-total_allocated_-then-fetch_add (check-then-act)
+      // let two threads both pass the check and both charge, oversubscribing
+      // past mem_limit_. The check now includes the already-reserved counter
+      // (cur) — the CAS only serializes against reserved_bytes_, so the
+      // admission check must validate the new reserved total against the
+      // remaining capacity. Overflow guards prevent `used + bytes` (and the
+      // further +cur) from wrapping past a huge value and falsely passing.
+      std::size_t cur = reserved_bytes_.load(std::memory_order_relaxed);
+      while (true) {
+        std::size_t used = total_allocated_.load(std::memory_order_relaxed);
+        std::size_t used_plus_bytes = used + bytes;
+        if (used_plus_bytes < used) {  // used + bytes overflowed
+          throw std::runtime_error(
+            "cuCascade: fixed_size_host_memory_resource::reserve size overflow");
+        }
+        std::size_t total = used_plus_bytes + cur;
+        if (total < used_plus_bytes) {  // adding cur overflowed
+          throw std::runtime_error(
+            "cuCascade: fixed_size_host_memory_resource::reserve size overflow");
+        }
+        if (total > mem_limit_) {
+          throw std::runtime_error(
+            "cuCascade: fixed_size_host_memory_resource::reserve exceeds mem_limit");
+        }
+        if (reserved_bytes_.compare_exchange_weak(cur, cur + bytes,
+                std::memory_order_relaxed)) {
+          break;
+        }
+        // cur reloaded by the failed CAS; retry with the new value.
       }
+    } else {
+      reserved_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     }
-    reserved_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     active_reservations_.fetch_add(1, std::memory_order_relaxed);
     // The reservation holds a pointer back to this resource so its release
     // callback can decrement the counters. memory_space owns this resource
