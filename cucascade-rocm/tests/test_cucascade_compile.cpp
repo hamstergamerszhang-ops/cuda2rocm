@@ -48,7 +48,10 @@ int main() {
     memory::throw_on_oom_policy p;
     bool threw = false;
     try {
-      p.handle_oom(1024, 0);
+      auto eptr = std::make_exception_ptr(std::runtime_error("test OOM"));
+      memory::oom_handling_policy::RetryFunc retry =
+        [](std::size_t, rmm::cuda_stream_view) -> void* { return nullptr; };
+      p.handle_oom(1024, rmm::cuda_stream_view{}, eptr, retry);
     } catch (const std::exception&) {
       threw = true;
     }
