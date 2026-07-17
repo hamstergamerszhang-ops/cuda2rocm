@@ -13,10 +13,10 @@
 
 #pragma once
 #include <cuda_runtime.h>  // shim → hip runtime
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
-#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -149,8 +149,8 @@ class topology_discovery {
         std::ifstream f(path);
         if (f) {
           int32_t node = -1;
-          f >> node;
-          return node;
+          if (f >> node) return node;
+          return -1;  // parse failure — don't return 0 (valid NUMA node)
         }
       }
     }

@@ -171,17 +171,16 @@ class memory_reservation_manager {
   virtual std::size_t get_active_reservation_count() const { return active_reservations_.load(std::memory_order_relaxed); }
 
   virtual void shutdown() {
+    // Signal outstanding release callbacks FIRST, before destroying spaces.
+    // A late callback that fires during spaces_.clear() (via reservation
+    // destructor) must see the flag as true to skip the counter decrement.
+    shutdown_flag_->store(true, std::memory_order_release);
     // Clear raw-pointer views before destroying the owning memory_space objects,
     // otherwise subsequent access through get_all_memory_spaces() / get_memory_spaces_for_tier()
     // would return dangling pointers.
     all_spaces_.clear();
     tier_spaces_.clear();
     spaces_.clear();
-    // Signal outstanding release callbacks (attached to Sirius-held
-    // reservations) to become no-ops: after shutdown they must not decrement
-    // the counter through `this`. The flag is held via shared_ptr so it (and
-    // the callback's check) survive destruction of this manager object.
-    shutdown_flag_->store(true, std::memory_order_release);
     // Reset the active-reservation counter: reservations are owned by Sirius
     // (not by the manager), so destroying spaces_ above does not run their
     // release callbacks. Reset here so the counter doesn't outlive the spaces
