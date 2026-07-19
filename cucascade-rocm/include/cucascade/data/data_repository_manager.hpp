@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -17,9 +18,18 @@ namespace cucascade {
 
 class data_repository_manager {
  public:
+  // The key OWNS its port_name (std::string, not std::string_view). The old
+  // std::string_view key dangled if the referent was destroyed before the map
+  // entry — subsequent find()/equality comparisons read dangling bytes. Since
+  // the map outlives the call that inserted the entry, the key must own its
+  // port name. A constructor from (size_t, string_view) keeps the existing
+  // call sites (which pass string_view) working via aggregate-init-style
+  // brace construction {operator_id, port_name}.
   struct operator_port_key {
     std::size_t operator_id;
-    std::string_view port_name;
+    std::string port_name;
+    operator_port_key(std::size_t id, std::string_view name)
+      : operator_id(id), port_name(name) {}
     bool operator==(operator_port_key const& o) const {
       return operator_id == o.operator_id && port_name == o.port_name;
     }
@@ -27,7 +37,7 @@ class data_repository_manager {
 
   struct leaked_repository_info {
     std::size_t operator_id;
-    std::string_view port_name;
+    std::string port_name;  // owns its data (returned across clear_all_repositories)
     std::size_t batch_count;
   };
 

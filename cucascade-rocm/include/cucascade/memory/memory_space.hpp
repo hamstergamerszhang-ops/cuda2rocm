@@ -48,10 +48,10 @@ class memory_space {
   // cuda_stream_view where a view is needed.
   borrowed_stream acquire_stream() {
     if (!streams_) throw std::runtime_error("cuCascade: no stream pool");
-    return streams_->acquire_stream(stream_acquire_policy::GROW);
+    return streams_->acquire_stream(exclusive_stream_pool::stream_acquire_policy::GROW);
   }
   borrowed_stream acquire_stream() const {
-    if (streams_) return streams_->acquire_stream(stream_acquire_policy::GROW);
+    if (streams_) return streams_->acquire_stream(exclusive_stream_pool::stream_acquire_policy::GROW);
     // No pool: wrap the per-thread stream in a non-owning borrowed_stream
     // (pool_ == nullptr) so release() is a no-op and the stream is not
     // returned to a pool that doesn't exist.
@@ -248,5 +248,35 @@ class memory_space {
     std::size_t bytes_{0};
   };
 };
+
+// --- Out-of-line definitions of reservation's memory_space-dependent methods ---
+// Defined here (after memory_space is complete) so the member access compiles
+// on strict compilers (clang). See the note in memory_reservation.hpp.
+inline Tier reservation::tier() const {
+  return space_ ? space_->get_tier() : Tier::HOST;
+}
+inline int32_t reservation::device_id() const {
+  return space_ ? space_->get_device_id() : 0;
+}
+inline memory_space const& reservation::get_memory_space() const {
+  if (!space_) { throw std::runtime_error("cuCascade: reservation has no memory_space"); }
+  return *space_;
+}
+template <typename T>
+inline T* reservation::get_memory_resource_as() {
+  return space_ ? space_->template get_memory_resource_as<T>() : nullptr;
+}
+template <typename T>
+inline T const* reservation::get_memory_resource_as() const {
+  return space_ ? space_->template get_memory_resource_as<T>() : nullptr;
+}
+template <Tier TIER>
+inline typename tier_memory_resource_trait<TIER>::type* reservation::get_memory_resource_of() {
+  return space_ ? space_->template get_memory_resource_of<TIER>() : nullptr;
+}
+template <Tier TIER>
+inline typename tier_memory_resource_trait<TIER>::type const* reservation::get_memory_resource_of() const {
+  return space_ ? space_->template get_memory_resource_of<TIER>() : nullptr;
+}
 
 }  // namespace cucascade::memory

@@ -29,7 +29,19 @@ enum class batch_state { idle, read_only, mutable_locked };
 class idata_representation {
  public:
   explicit idata_representation(memory::memory_space& space) : space_(&space) {}
-  virtual ~idata_representation() = default;
+  // Destroy the writer event if record_writer_event() created one. The old
+  // `= default` destructor never freed writer_event_, so every representation
+  // that called record_writer_event() leaked a hipEvent (created via
+  // hipEventCreateWithFlags in record_writer_event). Subclasses with their own
+  // destructors still run this via the base destructor chain.
+  virtual ~idata_representation() {
+    if (writer_event_) {
+      // Ignore the return value: nothing to do on failure during destruction,
+      // and the event pointer is not reused after this point.
+      (void)hipEventDestroy(writer_event_);
+      writer_event_ = nullptr;
+    }
+  }
 
   virtual memory::Tier get_current_tier() const { return memory::Tier::GPU; }
   virtual int32_t get_device_id() const { return 0; }

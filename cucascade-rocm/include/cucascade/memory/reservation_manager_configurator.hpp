@@ -48,9 +48,27 @@ class reservation_manager_configurator {
   std::vector<memory_space_config> build(system_topology_info const& topo = {}) {
     std::vector<memory_space_config> configs;
     std::size_t ngpus = num_gpus_ > 0 ? num_gpus_ : topo.num_gpus;
-    for (std::size_t i = 0; i < ngpus; ++i) {
+    // Determine the device-id list. If set_gpu_ids() was called, emit configs
+    // for exactly those IDs (in the caller's order); the old code ignored
+    // gpu_ids_ and emitted sequential 0..N-1, so a caller that set specific
+    // device IDs got configs for the wrong devices.
+    std::vector<int32_t> ids;
+    if (!gpu_ids_.empty()) {
+      ids = gpu_ids_;
+    } else {
+      ids.reserve(ngpus);
+      for (std::size_t i = 0; i < ngpus; ++i) ids.push_back(static_cast<int32_t>(i));
+    }
+    for (auto dev_id : ids) {
       gpu_memory_space_config gpu_cfg;
-      gpu_cfg.device_id = static_cast<int32_t>(i);
+      gpu_cfg.device_id = dev_id;
+      // Absolute limits are applied directly. Ratio-based sizing
+      // (gpu_usage_ratio_ / gpu_reservation_fraction_) would require the
+      // per-GPU total memory from the topology; the configurator does not
+      // currently carry that, so those remain documented-as-set for a future
+      // topology-aware build() overload. At least the absolute setters now
+      // reach the emitted config (previously only usage_limit/reservation_limit
+      // were copied, and even those were emitted against the wrong device id).
       gpu_cfg.usage_limit = gpu_usage_limit_;
       gpu_cfg.reservation_limit = gpu_reservation_limit_;
       configs.push_back(gpu_cfg);

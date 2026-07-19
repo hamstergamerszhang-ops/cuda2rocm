@@ -58,40 +58,38 @@ class reservation {
   std::size_t size() const {
     return arena_ ? arena_->size() : 0;
   }
-  Tier tier() const { return space_ ? space_->get_tier() : Tier::HOST; }
-  int32_t device_id() const { return space_ ? space_->get_device_id() : 0; }
-  memory_space const& get_memory_space() const {
-    if (!space_) { throw std::runtime_error("cuCascade: reservation has no memory_space"); }
-    return *space_;
-  }
+  // These 5 methods delegate to the owning memory_space, which is only
+  // forward-declared here (its full definition is in memory_space.hpp, which
+  // includes this file). They are DECLARED here but DEFINED out-of-line at the
+  // bottom of memory_space.hpp (after memory_space is complete). The old code
+  // defined them inline and relied on two-phase-lookup leniency to defer the
+  // member access — gcc/hipcc accept that, but clang rejects it ("member access
+  // into incomplete type"). Moving the definitions is the standard C++ idiom
+  // for this circular dependency and makes the code portable.
+  Tier tier() const;
+  int32_t device_id() const;
+  memory_space const& get_memory_space() const;
 
   void grow_by(std::size_t n) { if (arena_) arena_->grow_by(n); }
   void shrink_to_fit() { if (arena_) arena_->shrink_to_fit(); }
 
-  // Delegate to the owning memory_space. memory_space is only forward-declared
-  // here (its full definition is in memory_space.hpp, which includes this
-  // file), so these templates are defined inline but rely on two-phase name
-  // lookup: the complete type is required only at instantiation (i.e. at the
-  // call site, where memory_space.hpp is already in scope), not at definition.
-  // This mirrors the real cuCascade: a reservation is a handle into its space's
-  // resource registry.
+  /// Read-only access to the underlying arena. Used by host memory resources
+  /// to look up the per-reservation allocation tracker in
+  /// allocate_multiple_blocks(reservation*) — the tracker is keyed by the
+  /// arena pointer, mirroring the real cuCascade's chunked_reserved_area map.
+  reserved_arena* arena() const noexcept { return arena_.get(); }
+
+  // Template overloads that delegate to memory_space — also defined out-of-line
+  // at the bottom of memory_space.hpp.
   template <typename T>
-  T* get_memory_resource_as() {
-    return space_ ? space_->template get_memory_resource_as<T>() : nullptr;
-  }
+  T* get_memory_resource_as();
   template <typename T>
-  T const* get_memory_resource_as() const {
-    return space_ ? space_->template get_memory_resource_as<T>() : nullptr;
-  }
+  T const* get_memory_resource_as() const;
 
   template <Tier TIER>
-  typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of() {
-    return space_ ? space_->template get_memory_resource_of<TIER>() : nullptr;
-  }
+  typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of();
   template <Tier TIER>
-  typename tier_memory_resource_trait<TIER>::type const* get_memory_resource_of() const {
-    return space_ ? space_->template get_memory_resource_of<TIER>() : nullptr;
-  }
+  typename tier_memory_resource_trait<TIER>::type const* get_memory_resource_of() const;
 
   static std::unique_ptr<reservation> create(memory_space& space,
                                              std::unique_ptr<reserved_arena> arena,

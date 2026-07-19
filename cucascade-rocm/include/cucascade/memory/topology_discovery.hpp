@@ -154,14 +154,21 @@ class topology_discovery {
         }
       }
     }
-    // Fallback: try cardN
-    std::string card_path = "/sys/class/drm/card" + std::to_string(gpu_id) +
-                            "/device/numa_node";
-    std::ifstream f(card_path);
-    if (f) {
-      int32_t node = -1;
-      f >> node;
-      return node;
+    // Fallback: scan cardN devices (0..31) by PCI bus match. The old code
+    // used the HIP device index directly as cardN, but HIP enumeration order
+    // need not match the drm cardN probe order — so the fallback could read
+    // the wrong GPU's numa_node and attribute it to gpu_id. Scan by PCI slot
+    // instead, the same way the renderD path does.
+    for (int card = 0; card < 32; ++card) {
+      if (!matches_card_pci(card, gpu_id)) continue;
+      std::string card_path = "/sys/class/drm/card" + std::to_string(card) +
+                              "/device/numa_node";
+      std::ifstream f(card_path);
+      if (f) {
+        int32_t node = -1;
+        if (f >> node) return node;
+        return -1;  // parse failure — don't return 0 (valid NUMA node)
+      }
     }
     return -1;
   }
@@ -180,13 +187,18 @@ class topology_discovery {
         }
       }
     }
-    std::string card_path = "/sys/class/drm/card" + std::to_string(gpu_id) +
-                            "/device/local_cpulist";
-    std::ifstream f(card_path);
-    if (f) {
-      std::string cpus;
-      std::getline(f, cpus);
-      return cpus;
+    // Fallback: scan cardN devices by PCI match (same rationale as
+    // read_sysfs_numa_node — HIP index ≠ drm cardN).
+    for (int card = 0; card < 32; ++card) {
+      if (!matches_card_pci(card, gpu_id)) continue;
+      std::string card_path = "/sys/class/drm/card" + std::to_string(card) +
+                              "/device/local_cpulist";
+      std::ifstream f(card_path);
+      if (f) {
+        std::string cpus;
+        std::getline(f, cpus);
+        return cpus;
+      }
     }
     return "";
   }
@@ -214,6 +226,29 @@ class topology_discovery {
     // Normalize: GPU returns "0000:XX:YY.Z", sysfs may use same or "0000:XX:YY.Z"
     // Just compare the bus:device portion
     return pci_buses_match(gpu_pci, render_pci.c_str());
+  }
+
+  /// Same as matches_gpu_pci but for the cardN (not renderDNN) sysfs path.
+  /// Used by the fallback scan in read_sysfs_numa_node / read_sysfs_cpulist.
+  static bool matches_card_pci(int card_id, int gpu_id) {
+    char gpu_pci[32] = {0};
+    if (hipDeviceGetPCIBusId(gpu_pci, sizeof(gpu_pci), gpu_id) != hipSuccess) {
+      return false;
+    }
+    std::string path = "/sys/class/drm/card" + std::to_string(card_id) +
+                       "/device/uevent";
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    std::string card_pci;
+    while (std::getline(f, line)) {
+      if (line.rfind("PCI_SLOT_NAME=", 0) == 0) {
+        card_pci = line.substr(14);
+        break;
+      }
+    }
+    if (card_pci.empty()) return false;
+    return pci_buses_match(gpu_pci, card_pci.c_str());
   }
 
   /// Compare two PCI bus ID strings for same device (bus:device, ignoring function)

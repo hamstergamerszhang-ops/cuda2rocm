@@ -86,17 +86,9 @@ class exclusive_stream_pool {
     hipDeviceGetStreamPriorityRange(&min_priority, &max_priority);
     // max_priority is the "highest" (most negative on CUDA, lowest value).
     // Use it for half the pool (scan operators), normal for the rest.
-    bool use_priority = (min_priority != max_priority);
+    priority_range_ = {(min_priority != max_priority), min_priority, max_priority};
     for (std::size_t i = 0; i < pool_size; ++i) {
-      hipStream_t s = nullptr;
-      // Alternate: even-indexed streams get high priority (for scans),
-      // odd-indexed get normal priority (for compute).
-      int priority = (use_priority && (i % 2 == 0)) ? max_priority : 0;
-      if (priority != 0) {
-        hipStreamCreateWithPriority(&s, flags_.value(), priority);
-      } else {
-        hipStreamCreateWithFlags(&s, flags_.value());
-      }
+      hipStream_t s = create_stream_with_priority(i);
       if (s) {
         streams_.push_back(s);
         free_.push_back(true);
@@ -107,7 +99,14 @@ class exclusive_stream_pool {
   ~exclusive_stream_pool() {
     rmm::cuda_set_device_raii set_device{device_id_};
     for (auto s : streams_) {
-      if (s) hipStreamDestroy(s);
+      if (!s) continue;
+      // Synchronize before destroying: hipStreamDestroy on a stream with
+      // pending async work fails (or leaks the pending work, depending on the
+      // runtime). The old code destroyed without syncing and ignored the
+      // return value, so a stream with in-flight kernels could be torn down
+      // out from under it.
+      (void)hipStreamSynchronize(s);
+      (void)hipStreamDestroy(s);
     }
   }
 
@@ -124,12 +123,16 @@ class exclusive_stream_pool {
         return borrowed_stream{rmm::cuda_stream_view{streams_[i]}, i, this};
       }
     }
-    // GROW: create a new stream on this pool's device
+    // GROW: create a new stream on this pool's device, applying the SAME
+    // priority selection as the constructor (even-indexed = high priority for
+    // scans, odd-indexed = normal for compute). The old GROW path used
+    // hipStreamCreateWithFlags unconditionally, so dynamically-grown streams
+    // always got normal priority, contradicting the ctor's high/low scheme.
     if (policy == stream_acquire_policy::GROW) {
       rmm::cuda_set_device_raii set_device{device_id_};
-      hipStream_t s = nullptr;
-      if (hipStreamCreateWithFlags(&s, flags_.value()) == hipSuccess) {
-        std::size_t index = streams_.size();
+      std::size_t index = streams_.size();
+      hipStream_t s = create_stream_with_priority(index);
+      if (s) {
         streams_.push_back(s);
         free_.push_back(false);
         return borrowed_stream{rmm::cuda_stream_view{s}, index, this};
@@ -151,11 +154,39 @@ class exclusive_stream_pool {
   rmm::cuda_device_id get_device_id() const { return device_id_; }
 
  private:
+  /// Create a stream applying the priority scheme. Even-indexed streams get
+  /// the highest priority (for scan operators — latency-sensitive, I/O-bound),
+  /// odd-indexed get normal priority (for compute operators). Centralized so
+  /// the constructor and the GROW path use the same selection.
+  hipStream_t create_stream_with_priority(std::size_t index) {
+    hipStream_t s = nullptr;
+    bool use_priority = priority_range_.supported;
+    int max_priority = priority_range_.max;
+    int priority = (use_priority && (index % 2 == 0)) ? max_priority : 0;
+    if (priority != 0) {
+      if (hipStreamCreateWithPriority(&s, flags_.value(), priority) != hipSuccess) {
+        s = nullptr;
+      }
+    } else {
+      if (hipStreamCreateWithFlags(&s, flags_.value()) != hipSuccess) {
+        s = nullptr;
+      }
+    }
+    return s;
+  }
+
+  struct priority_range {
+    bool supported{false};
+    int min{0};
+    int max{0};
+  };
+
   rmm::cuda_device_id device_id_;
   std::size_t pool_size_{0};
   rmm::cuda_stream::flags flags_{};
   std::vector<hipStream_t> streams_;
   std::vector<bool> free_;
+  priority_range priority_range_;
   // mutable: size() is const but must lock to read streams_ safely.
   mutable std::mutex pool_mutex_;
 };
