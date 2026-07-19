@@ -126,21 +126,32 @@ class memory_reservation_manager {
 
   virtual std::unique_ptr<reservation> request_reservation(
     reservation_request_strategy const& strategy, std::size_t bytes) {
-    // Find a matching space with available memory
+    // Find a matching space with available memory. The get_available_memory()
+    // check is a fast-path hint only — it is a read-then-act over a separate
+    // atomic, so a concurrent reservation on another thread can win the
+    // make_reservation CAS after this thread's check passed, causing
+    // make_reservation to throw. Catch that race and fall through to the
+    // make_reservation_or_null loop (which returns nullptr instead of throwing
+    // and tries every matching space), so a transient capacity race does not
+    // surface as a spurious throw when capacity is actually available on
+    // another matching space.
     for (auto* s : all_spaces_) {
       if (strategy.matches(*s) && s->get_available_memory() >= bytes) {
-        // Capture the shutdown flag by value (shared_ptr copy) so the callback
-        // can run after this manager is destroyed without dereferencing a
-        // dangling `this`: reservations are owned by Sirius, so a release
-        // callback may fire post-shutdown. The flag check (on the shared_ptr,
-        // not through `this`) gates the counter decrement.
         auto flag = shutdown_flag_;
-        auto r = s->make_reservation(bytes, [this, flag]() {
-          if (flag->load(std::memory_order_acquire)) return;
-          active_reservations_.fetch_sub(1, std::memory_order_relaxed);
-        });
-        active_reservations_.fetch_add(1, std::memory_order_relaxed);
-        return r;
+        try {
+          auto r = s->make_reservation(bytes, [this, flag]() {
+            if (flag->load(std::memory_order_acquire)) return;
+            active_reservations_.fetch_sub(1, std::memory_order_relaxed);
+          });
+          active_reservations_.fetch_add(1, std::memory_order_relaxed);
+          return r;
+        } catch (const std::runtime_error&) {
+          // Lost the CAS race against a concurrent reservation on this space,
+          // or the limit shrank between the check and the charge. Fall through
+          // to the make_reservation_or_null pass, which tries every matching
+          // space (including this one) without throwing.
+          break;
+        }
       }
     }
     // Try make_reservation_or_null on any matching space

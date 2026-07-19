@@ -64,8 +64,11 @@ class reservation_aware_resource_adaptor {
       std::lock_guard<std::mutex> lk(tracker_mutex_);
       current = stream_tracker_[stream].current_bytes.load(std::memory_order_relaxed);
     }
-    // Respect a reservation limit if one was set (0 = unlimited).
-    if (reservation_limit_ != 0 && current + bytes > reservation_limit_) {
+    // Respect a reservation limit if one was set (0 = unlimited). Overflow-
+    // safe: `current + bytes > reservation_limit_` can wrap size_t for a huge
+    // bytes, falsely passing the check and admitting an over-limit reservation.
+    if (reservation_limit_ != 0 &&
+        (bytes > reservation_limit_ || current > reservation_limit_ - bytes)) {
       std::exception_ptr eptr;
       try {
         throw std::runtime_error(
@@ -76,18 +79,27 @@ class reservation_aware_resource_adaptor {
       }
       oom_handling_policy::RetryFunc retry =
         [this](std::size_t b, rmm::cuda_stream_view) { return upstream_.allocate(b, 0); };
-      // Invoke handle_oom INSIDE the lock: oom_policy_for() previously
-      // returned a raw pointer into stream_tracker_ and released the lock, so
-      // a concurrent attach/erase could destroy the policy before this call
-      // ran (use-after-free). Also use the correct 4-arg signature
-      // (requested_bytes, stream, eptr, retry) — the old call passed
-      // (bytes, current), which did not match handle_oom's signature.
+      // Invoke handle_oom INSIDE the lock (a raw pointer into stream_tracker_
+      // would dangle if a concurrent attach/erase rehashed the map) and USE
+      // the returned pointer: a recovering policy (e.g.
+      // defragmenter_oom_policy) defrags and retries upstream_.allocate,
+      // returning the recovered pointer. Discarding it + unconditionally
+      // rethrowing (the old code) leaked the recovered allocation and
+      // defeated the retry mechanism for any non-throwing policy.
+      void* recovered = nullptr;
       {
         std::lock_guard<std::mutex> lk(tracker_mutex_);
         auto it = stream_tracker_.find(stream);
         if (it != stream_tracker_.end() && it->second.oom_policy) {
-          it->second.oom_policy->handle_oom(bytes, stream, eptr, retry);
+          recovered = it->second.oom_policy->handle_oom(bytes, stream, eptr, retry);
         }
+      }
+      if (recovered) {
+        // The policy recovered a normal upstream device allocation via retry.
+        // Charge the per-stream tracker + global total (no spill entry: it is
+        // not a host/UVM fallback) and return it.
+        charge_stream(stream, bytes);
+        return recovered;
       }
       std::rethrow_exception(eptr);
     }
@@ -139,16 +151,28 @@ class reservation_aware_resource_adaptor {
         total_allocated_.fetch_add(bytes, std::memory_order_relaxed);
         return ptr;
       }
-      // All tiers failed — invoke OOM policy and rethrow
-      // Invoke handle_oom INSIDE the lock (same reason as the
-      // reservation-limit path above) and with the correct 4-arg signature.
+      // All tiers failed — invoke OOM policy. As in the reservation-limit path,
+      // USE the returned pointer if the policy recovers (e.g. defragmenter
+      // defrags then retries upstream_.allocate). The old code discarded the
+      // return and unconditionally rethrew, leaking any recovered allocation
+      // and defeating the retry mechanism for non-throwing policies.
       {
-        std::lock_guard<std::mutex> lk(tracker_mutex_);
-        auto it = stream_tracker_.find(stream);
-        if (it != stream_tracker_.end() && it->second.oom_policy) {
-          oom_handling_policy::RetryFunc retry =
-            [this](std::size_t b, rmm::cuda_stream_view) { return upstream_.allocate(b, 0); };
-          it->second.oom_policy->handle_oom(bytes, stream, std::current_exception(), retry);
+        void* recovered = nullptr;
+        {
+          std::lock_guard<std::mutex> lk(tracker_mutex_);
+          auto it = stream_tracker_.find(stream);
+          if (it != stream_tracker_.end() && it->second.oom_policy) {
+            oom_handling_policy::RetryFunc retry =
+              [this](std::size_t b, rmm::cuda_stream_view) { return upstream_.allocate(b, 0); };
+            recovered =
+              it->second.oom_policy->handle_oom(bytes, stream, std::current_exception(), retry);
+          }
+        }
+        if (recovered) {
+          // Policy recovered a normal upstream device allocation. Charge it
+          // (no spill entry) and return.
+          charge_stream(stream, bytes);
+          return recovered;
         }
       }
       throw;
@@ -191,11 +215,19 @@ class reservation_aware_resource_adaptor {
         host_spilled_.erase(it);
         auto tracker_it = stream_tracker_.find(stream);
         if (tracker_it != stream_tracker_.end()) {
-          std::size_t cur = tracker_it->second.current_bytes.load(std::memory_order_relaxed);
-          std::size_t sub = cur > bytes ? cur - bytes : 0;
-          tracker_it->second.current_bytes.store(sub, std::memory_order_relaxed);
+          // C9: atomic subtract clamped at 0 — the old load/sub/store was a
+          // read-modify-write race that lost updates under concurrent
+          // allocate (fetch_add) or concurrent dealloc on the same stream.
+          clamped_sub(tracker_it->second.current_bytes, bytes);
         }
-        total_allocated_.fetch_sub(bytes, std::memory_order_relaxed);
+        // Gap-2 fix: use clamped_sub (not raw fetch_sub) for the global
+        // counter too, matching the normal dealloc path. The old spilled
+        // path used fetch_sub unconditionally — if there was any bookkeeping
+        // asymmetry (e.g. a double dealloc, or a dealloc without a matching
+        // spilled alloc charge), it would wrap total_allocated_ to ~SIZE_MAX,
+        // permanently breaking the memory accounting the defragment warning
+        // and OOM backpressure rely on.
+        clamped_sub(total_allocated_, bytes);
         return;
       }
     }
@@ -205,10 +237,15 @@ class reservation_aware_resource_adaptor {
       std::lock_guard<std::mutex> lk(tracker_mutex_);
       auto it = stream_tracker_.find(stream);
       if (it != stream_tracker_.end()) {
-        std::size_t cur = it->second.current_bytes.load(std::memory_order_relaxed);
-        std::size_t sub = cur > bytes ? cur - bytes : 0;
-        it->second.current_bytes.store(sub, std::memory_order_relaxed);
+        // C9: same clamped atomic subtract as the spilled path.
+        clamped_sub(it->second.current_bytes, bytes);
       }
+      // C10: the normal (non-spilled) deallocate path previously did NOT
+      // decrement total_allocated_, while allocate always increments it — so
+      // the global counter grew monotonically across every normal
+      // alloc/dealloc cycle, breaking memory accounting (e.g. defragment's
+      // pressure warning fired forever after the first freed allocation).
+      clamped_sub(total_allocated_, bytes);
     }
   }
 
@@ -286,6 +323,35 @@ class reservation_aware_resource_adaptor {
   }
 
  private:
+  /// Charge `bytes` to the per-stream tracker (current + peak) and the global
+  /// total. Used by the OOM-recovery paths that obtain a pointer via the
+  /// policy's retry (a normal upstream device allocation, not a spill).
+  void charge_stream(rmm::cuda_stream_view stream, std::size_t bytes) {
+    std::lock_guard<std::mutex> lk(tracker_mutex_);
+    auto& tracker = stream_tracker_[stream];
+    tracker.current_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    std::size_t now = tracker.current_bytes.load(std::memory_order_relaxed);
+    std::size_t peak = tracker.peak_bytes.load(std::memory_order_relaxed);
+    while (now > peak && !tracker.peak_bytes.compare_exchange_weak(peak, now,
+             std::memory_order_relaxed)) {}
+    total_allocated_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+
+  /// Subtract `bytes` from an atomic counter, clamped at 0. CAS loop — no
+  /// read-modify-write race (the old load/sub/store lost updates under
+  /// concurrent fetch_add / concurrent dealloc on the same stream) and no
+  /// underflow (a bookkeeping asymmetry can't wrap the counter to ~SIZE_MAX).
+  static void clamped_sub(std::atomic<std::size_t>& counter, std::size_t bytes) {
+    std::size_t cur = counter.load(std::memory_order_relaxed);
+    while (cur > 0) {
+      std::size_t next = cur > bytes ? cur - bytes : 0;
+      if (counter.compare_exchange_weak(cur, next, std::memory_order_relaxed)) {
+        break;
+      }
+      // cur reloaded by the failed CAS; retry.
+    }
+  }
+
   rmm::device_async_resource_ref upstream_;
   std::size_t reservation_limit_{0};
   int device_id_{0};  // captured in the ctor for defragment()'s hipDeviceGetMemPool

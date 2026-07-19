@@ -126,7 +126,18 @@ class bloom_filter {
     if (block_extent_ == 0) {
       throw std::runtime_error("cuco::bloom_filter: block_extent must be greater than 0");
     }
-    std::size_t bytes = block_extent_ * words_per_block * sizeof(word_type);
+    // Overflow-safe byte count: block_extent_ * words_per_block * sizeof(word_type)
+    // can wrap size_t for a caller-supplied block_extent near SIZE_MAX, yielding
+    // a small hipMalloc while kernels index the full block_extent_ → OOB device
+    // reads/writes. Reject before allocating if the product overflows.
+    if (block_extent_ != 0 && words_per_block > SIZE_MAX / block_extent_) {
+      throw std::runtime_error("cuco::bloom_filter: block_extent * words_per_block overflows size_t");
+    }
+    std::size_t words_total = block_extent_ * words_per_block;
+    if (words_total != 0 && sizeof(word_type) > SIZE_MAX / words_total) {
+      throw std::runtime_error("cuco::bloom_filter: words_total * sizeof(word_type) overflows size_t");
+    }
+    std::size_t bytes = words_total * sizeof(word_type);
     if (hipMalloc(&bits_, bytes) != hipSuccess) {
       throw std::runtime_error("cuco::bloom_filter: hipMalloc failed");
     }

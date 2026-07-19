@@ -140,6 +140,12 @@ class static_set {
     if (capacity_ == 0) {
       throw std::runtime_error("cuco::static_set: capacity must be greater than 0");
     }
+    // Overflow-safe byte count: capacity_ * sizeof(KeyT) can wrap size_t for a
+    // caller-supplied capacity near SIZE_MAX, yielding a small hipMalloc while
+    // kernels index the full capacity_ → OOB device access.
+    if (capacity_ != 0 && sizeof(KeyT) > SIZE_MAX / capacity_) {
+      throw std::runtime_error("cuco::static_set: capacity * sizeof(KeyT) overflows size_t");
+    }
     std::size_t bytes = capacity_ * sizeof(KeyT);
     if (hipMalloc(&slots_, bytes) != hipSuccess) {
       throw std::runtime_error("cuco::static_set: hipMalloc failed");
