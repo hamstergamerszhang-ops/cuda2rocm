@@ -242,7 +242,11 @@ class memory_space {
    public:
     explicit simple_arena(std::size_t n) : bytes_(n) {}
     std::size_t size() const override { return bytes_; }
-    void grow_by(std::size_t n) override { bytes_ += n; }
+    // Overflow-safe grow: saturate at SIZE_MAX instead of wrapping. The real
+    // cuCascade bounds this via atomic_bounded_counter/add_bounded. A wrapped
+    // bytes_ corrupts the arena size and the symmetric accounting in
+    // release_reservation / allocate_multiple_blocks.
+    void grow_by(std::size_t n) override { bytes_ = (n > SIZE_MAX - bytes_) ? SIZE_MAX : bytes_ + n; }
     void shrink_to_fit() override {}
    private:
     std::size_t bytes_{0};

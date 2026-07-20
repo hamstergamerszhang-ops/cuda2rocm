@@ -401,8 +401,13 @@ class fixed_size_host_memory_resource {
     std::atomic<int64_t> allocated_bytes{0};
   };
 
-  /// Round `bytes` up to the next multiple of `block_size_`.
+  /// Round `bytes` up to the next multiple of `block_size_`. Overflow-safe:
+  /// when `bytes + block_size - 1` would wrap size_t, saturate at SIZE_MAX
+  /// instead. The old code's wrapping result bypassed the `bytes > mem_limit_`
+  /// check and drove an undersized hipMallocHost allocation.
   static std::size_t align_up(std::size_t bytes, std::size_t block_size) {
+    if (block_size == 0) return bytes;
+    if (bytes > SIZE_MAX - (block_size - 1)) return SIZE_MAX;
     return ((bytes + block_size - 1) / block_size) * block_size;
   }
 
@@ -501,7 +506,10 @@ class fixed_size_host_memory_resource {
   struct reserved_arena_bytes : reserved_arena {
     explicit reserved_arena_bytes(std::size_t n) : bytes_(n) {}
     std::size_t size() const override { return bytes_; }
-    void grow_by(std::size_t n) override { bytes_ += n; }
+    // Overflow-safe grow: saturate at SIZE_MAX instead of wrapping. A wrapped
+    // bytes_ corrupts the arena size and the symmetric accounting in
+    // release_reservation / allocate_multiple_blocks.
+    void grow_by(std::size_t n) override { bytes_ = (n > SIZE_MAX - bytes_) ? SIZE_MAX : bytes_ + n; }
     std::size_t bytes_{0};
   };
 };

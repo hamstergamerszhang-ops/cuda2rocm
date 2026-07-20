@@ -29,10 +29,16 @@
 
 // Stub out the rmm::device_async_resource_ref dependency so this compiles
 // without hipMM installed. The real types are exercised in the full build.
+// Guarded so an external stub (e.g. from a test harness) can provide a richer
+// rmm::device_async_resource_ref with allocate/deallocate methods without
+// conflicting with this minimal stub.
+#ifndef RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
+#define RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
 namespace rmm {
 struct device_async_resource_ref {};
 inline device_async_resource_ref get_current_device_resource() { return {}; }
 }  // namespace rmm
+#endif
 
 int main() {
   using namespace cucascade;
@@ -67,28 +73,40 @@ int main() {
     assert(!fail.can_reserve(1, 0) && "fail policy always denies");
   }
 
-  // --- representation_converter: registry ---
+  // --- representation_converter_registry: templated register/has/clear ---
+  // The old test referenced data::representation_converter with int-keyed
+  // has_converter(0,1) / register_converter(0,1,...) — that type/API does not
+  // exist. The real registry is cucascade::representation_converter_registry
+  // with templated register_converter<Src,Target>(fn) / has_converter<Src,Target>().
   {
-    data::representation_converter conv;
-    assert(!conv.has_converter(0, 1) && "empty registry has no converters");
-    conv.register_converter(0, 1, [](void*) { return std::unique_ptr<idata_representation>{}; });
-    assert(conv.has_converter(0, 1) && "converter registered");
+    representation_converter_registry conv;
+    assert(!(conv.has_converter<idata_representation, idata_representation>()) &&
+           "empty registry has no converters");
+    conv.register_converter<idata_representation, idata_representation>(
+      [](idata_representation const& /*src*/,
+         memory::memory_space const* /*space*/,
+         rmm::cuda_stream_view /*stream*/) -> std::unique_ptr<idata_representation> {
+        return nullptr;
+      });
+    assert((conv.has_converter<idata_representation, idata_representation>()) &&
+           "converter registered");
     conv.clear();
-    assert(!conv.has_converter(0, 1) && "cleared registry has no converters");
+    assert(!(conv.has_converter<idata_representation, idata_representation>()) &&
+           "cleared registry has no converters");
   }
 
-  // --- data_repository: push/size ---
+  // --- data_repository: push/size (cucascade namespace, not cucascade::data) ---
   {
-    data::data_repository repo;
-    assert(repo.size() == 0 && "empty repo");
-    // data_batch is needed for push; test the manager instead
+    data_repository repo;
+    assert(repo.total_size() == 0 && "empty repo");
+    assert(repo.all_empty() && "empty repo all_empty");
   }
 
-  // --- data_repository_manager: lookup ---
+  // --- data_repository_manager: lookup (cucascade namespace) ---
   {
-    data::data_repository_manager mgr;
-    // No repositories registered; lookup should return null/empty
-    (void)mgr;
+    data_repository_manager mgr;
+    // No repositories registered; lookup should return null
+    assert(mgr.get_repository(0, "default") == nullptr && "no repos registered");
   }
 
   printf("cucascade-rovm compile + logic test: ALL PASSED\n");
