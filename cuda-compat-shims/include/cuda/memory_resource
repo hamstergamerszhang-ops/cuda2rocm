@@ -25,7 +25,7 @@
   using any_resource = rmm::device_async_resource_ref;
 
   template <typename Resource, typename... Props>
-  concept resource_with = (sizeof...(Props) >= 0);
+  concept resource_with = true;
 
   }  // namespace mr
   }  // namespace cuda

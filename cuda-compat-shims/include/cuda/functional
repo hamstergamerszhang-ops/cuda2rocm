@@ -15,21 +15,43 @@
   #include <algorithm>
   #include <functional>
 
-  namespace cuda {
+namespace cuda {
 
-  template <typename T = void>
-  struct minimum {
-    __host__ __device__ constexpr T operator()(T const& a, T const& b) const {
-      return a < b ? a : b;
-    }
-  };
+template <typename T = void>
+struct minimum {
+  __host__ __device__ constexpr T operator()(T const& a, T const& b) const {
+    return a < b ? a : b;
+  }
+};
 
-  template <typename T = void>
-  struct maximum {
-    __host__ __device__ constexpr T operator()(T const& a, T const& b) const {
-      return a > b ? a : b;
-    }
-  };
+template <typename T = void>
+struct maximum {
+  __host__ __device__ constexpr T operator()(T const& a, T const& b) const {
+    return a > b ? a : b;
+  }
+};
 
-  }  // namespace cuda
+// void specializations: cuda::minimum<>{} and cuda::maximum<>{} (matching
+// CCCL's API) are callable with deduced argument types. Without these, the
+// primary template with T=void is non-callable (T const& with T=void is
+// ill-formed), so cuda::minimum<>{} fails to compile in the fallback path.
+template <>
+struct minimum<void> {
+  template <typename T, typename U>
+  __host__ __device__ constexpr auto operator()(T const& a, U const& b) const
+    -> decltype(a < b ? a : b) {
+    return a < b ? a : b;
+  }
+};
+
+template <>
+struct maximum<void> {
+  template <typename T, typename U>
+  __host__ __device__ constexpr auto operator()(T const& a, U const& b) const
+    -> decltype(a > b ? a : b) {
+    return a > b ? a : b;
+  }
+};
+
+}  // namespace cuda
 #endif

@@ -36,6 +36,7 @@ class reservation_limit_policy {
 
 class ignore_reservation_limit_policy : public reservation_limit_policy {};
 class fail_reservation_limit_policy : public reservation_limit_policy {
+ public:
   bool can_reserve(std::size_t, std::size_t) const override { return false; }
 };
 class increase_reservation_limit_policy : public reservation_limit_policy {};
