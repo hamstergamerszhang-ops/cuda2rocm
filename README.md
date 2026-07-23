@@ -30,8 +30,8 @@ target_link_libraries(my-target PRIVATE rocm-cuda-compat::cuda-compat-shims)
 cuCollections (cuco) is NVIDIA's GPU hash-map and Bloom-filter library, used by Sirius, RAPIDS, and the broader CUDA ecosystem. No ROCm port exists.
 
 **Scope:** Port the subset of cuco that Sirius uses:
-- `cuco::bloom_filter` (blocked Bloom filter) — ✅ Drafted, needs testing
-- `cuco::static_set` (open-addressing hash set) — ✅ Drafted, needs testing
+- `cuco::bloom_filter` (blocked Bloom filter) — 🔧 Drafted, needs testing
+- `cuco::static_set` (open-addressing hash set) — 🔧 Drafted, needs testing
 - `cuco::xxhash_64` (device-compatible xxHash) — ✅ Implemented
 - Supporting types: `cuco::extent`, `cuco::empty_key`, `cuco::arrow_filter_policy`,
   `cuco::default_filter_policy`, `cuco::double_hashing`, `cuco::default_hash_function`,
@@ -39,7 +39,14 @@ cuCollections (cuco) is NVIDIA's GPU hash-map and Bloom-filter library, used by 
 
 **Approach:** Use rocPRIM/hipCUB primitives (warp shuffles, atomicCAS) as building blocks, matching cuco's API surface exactly so downstream code compiles without changes. Target: `namespace cuco`, same headers, same templates.
 
-**Status:** Drafted (6 headers). Needs compile + runtime testing on gfx942.
+**Status:** Drafted (6 headers). Compile + runtime testing on gfx942 is
+**pending** — the test binaries (`test_bloom_filter.cu`, `test_static_set.cu`)
+are written and assert 7/7 keys found / 6/6 correct, but have not yet been
+compiled with hipcc and run on a real AMD GPU in this repo's CI. An earlier
+version of this README's "Verified on real hardware" section listed specific
+throughput figures (~3M keys/s, ~3.4M keys/s) for these; those claims are
+unreproduced and have been removed pending a real run. See the "Verified on
+real hardware" section below for what is and isn't actually verified.
 
 ### 3. `cucascade-rocm` — cuCascade memory reservation port 🔧 In Progress
 
@@ -90,13 +97,30 @@ ctest --test-dir build
 cmake --install build --prefix /opt/rocm
 ```
 
-### Verified on real hardware
+### Verification status
 
-- **Shim layer:** 0 compile errors on gfx942/ROCm 7.2.1 (hipcc 7.2.53211)
-- **cuco-rocm bloom_filter:** 7/7 keys found, FP rate 0.03%, ~3M keys/s
-- **cuco-rocm static_set:** 6/6 correct, ~3.4M keys/s
-- **Destructor stream-sync:** verified on non-default streams (no use-after-free)
+What's actually been verified, and what hasn't (stated plainly, because this
+repo is a public credibility reference and unverified claims are worse than
+no claim):
+
+- **Shim layer:** 0 compile errors on gfx942/ROCm 7.2.1 (hipcc 7.2.53211) —
+  verified in sirius-rocm's CI (`.github/workflows/rocm-test.yml`, green).
+- **cucascade-rocm pure-logic headers:** 4 of the 26 real headers
+  (`column_metadata`, `notification_channel`, `disk_table`,
+  `chunked_resource_info`) compile clean with g++ -std=c++20 (no HIP
+  dependency). The remaining 22 real headers transitively include
+  `hip/hip_runtime.h` via the cuda-compat-shims and require a HIP toolchain
+  to compile-verify — not yet done in this repo's CI (pending a self-hosted
+  ROCm runner).
+- **cuco-rocm bloom_filter / static_set:** **NOT verified.** The test
+  binaries are written and assert 7/7 keys found / 6/6 correct, but have not
+  been compiled with hipcc or run on a real AMD GPU. An earlier version of
+  this README listed throughput figures (~3M keys/s, ~3.4M keys/s) and a
+  "0.03% FP rate" for these — those figures are unreproduced and have been
+  removed. They will be filled in with real numbers once a self-hosted ROCm
+  runner is registered.
 - **hipMM (RMM for HIP):** built + installed to /opt/rocm on real gfx942
+  (per Sirius's build_rocm_deps.sh).
 
 ### Known build fixes (incorporated into Sirius's build_rocm_deps.sh)
 
