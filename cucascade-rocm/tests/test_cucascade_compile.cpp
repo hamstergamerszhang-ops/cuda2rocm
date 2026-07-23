@@ -14,6 +14,40 @@
 //! rmm:: types and hip runtime APIs; those are verified by the shim compile
 //! test in the CI workflow. This test covers the pure-logic headers.
 
+// Stub out the rmm::device_async_resource_ref / cuda_stream_view dependency
+// so this compiles without hipMM installed. The real types are exercised in
+// the full build. MUST come before the cucascade headers below -- they use
+// these types at header-parse time (common.hpp, oom_handling_policy.hpp gate
+// their own real <rmm/...> includes on this same macro), so defining the
+// stub after including them is too late regardless of the macro's state.
+// Guarded so an external stub (e.g. from a test harness) can provide a richer
+// rmm::device_async_resource_ref with allocate/deallocate methods without
+// conflicting with this minimal stub -- in that case the harness is
+// responsible for defining both the macro AND the types before this file is
+// compiled (e.g. via a prefix header), not just passing -D on the command
+// line.
+#include <new>
+#include <string>
+#ifndef RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
+#define RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
+namespace rmm {
+struct device_async_resource_ref {};
+inline device_async_resource_ref get_current_device_resource() { return {}; }
+// cuda_stream_view is only ever default-constructed and passed around in
+// this test (never called into) -- an empty stub covers every real usage.
+struct cuda_stream_view {};
+// cucascade_out_of_memory (cucascade/memory/error.hpp) derives from this and
+// constructs it from a std::string -- match real rmm::out_of_memory's shape
+// (a std::bad_alloc with a message) closely enough for that to compile.
+struct out_of_memory : std::bad_alloc {
+  explicit out_of_memory(std::string const& message) : _what(message) {}
+  const char* what() const noexcept override { return _what.c_str(); }
+ private:
+  std::string _what;
+};
+}  // namespace rmm
+#endif
+
 #include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/oom_handling_policy.hpp"
 #include "cucascade/data/representation_converter.hpp"
@@ -26,22 +60,6 @@
 #include <cstdio>
 #include <memory>
 #include <string>
-
-// Stub out the rmm::device_async_resource_ref dependency so this compiles
-// without hipMM installed. The real types are exercised in the full build.
-// Guarded so an external stub (e.g. from a test harness) can provide a richer
-// rmm::device_async_resource_ref with allocate/deallocate methods without
-// conflicting with this minimal stub.
-#ifndef RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
-#define RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
-namespace rmm {
-struct device_async_resource_ref {};
-inline device_async_resource_ref get_current_device_resource() { return {}; }
-// cuda_stream_view is only ever default-constructed and passed around in
-// this test (never called into) -- an empty stub covers every real usage.
-struct cuda_stream_view {};
-}  // namespace rmm
-#endif
 
 int main() {
   using namespace cucascade;

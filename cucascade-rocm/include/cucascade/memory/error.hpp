@@ -8,7 +8,11 @@
 
 #pragma once
 
+// Same stub-gate as common.hpp -- skip the real header when a caller has
+// already stubbed rmm::out_of_memory (see test_cucascade_compile.cpp).
+#ifndef RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
 #include <rmm/detail/error.hpp>  // rmm::out_of_memory, rmm::bad_alloc (hipMM has no rmm/out_of_memory.hpp)
+#endif
 #include <cuda_runtime.h>  // cudaMemPool_t (shim → hipMemPool_t)
 #include <cstddef>
 #include <string>
