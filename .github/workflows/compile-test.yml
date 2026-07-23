@@ -104,7 +104,16 @@ jobs:
           # test_cucascade_compile.cpp stubs rmm locally and tests the non-GPU
           # logic headers (oom policy, converter registry, repository). It
           # compiles with hipcc (C++20) without needing hipMM installed.
-          hipcc -std=c++20 -DRMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED \
+          # NOTE: don't pass -DRMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED here --
+          # the test file defines that macro itself, together with the actual
+          # stub types, in one self-contained #ifndef/#define block. Passing
+          # -D externally makes the macro "already defined" before the file's
+          # own block runs, which skips the type definitions inside it
+          # (its #ifndef guard exists for a *richer* external stub to disable
+          # this one, not for a bare command-line flag with no types behind
+          # it) -- that produced "use of undeclared identifier 'rmm'" once
+          # the header-gating fix landed.
+          hipcc -std=c++20 \
             -I cucascade-rocm/include -I cuda-compat-shims/include \
             -o /tmp/test_cucascade cucascade-rocm/tests/test_cucascade_compile.cpp
           echo "test_cucascade compile: EXIT=$?"
