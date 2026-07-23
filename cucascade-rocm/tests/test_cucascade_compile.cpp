@@ -28,14 +28,19 @@
 // line.
 #include <new>
 #include <string>
+#include <hip/hip_runtime.h>  // hipStream_t -- real HIP is installed in CI, no need to stub this part
 #ifndef RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
 #define RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
 namespace rmm {
 struct device_async_resource_ref {};
 inline device_async_resource_ref get_current_device_resource() { return {}; }
-// cuda_stream_view is only ever default-constructed and passed around in
-// this test (never called into) -- an empty stub covers every real usage.
-struct cuda_stream_view {};
+// cuda_stream_view is default-constructed and passed around in most of this
+// test; data/common.hpp's idata_representation also calls .value() to feed
+// hipEventRecord (declared but never actually invoked by this host-logic
+// test), so it needs to return a real hipStream_t, not just exist.
+struct cuda_stream_view {
+  hipStream_t value() const { return nullptr; }
+};
 // cucascade_out_of_memory (cucascade/memory/error.hpp) derives from this and
 // constructs it from a std::string -- match real rmm::out_of_memory's shape
 // (a std::bad_alloc with a message) closely enough for that to compile.
