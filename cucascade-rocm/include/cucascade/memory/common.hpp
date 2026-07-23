@@ -18,6 +18,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
 #endif
+#include <hip/hip_runtime.h>  // hipDeviceCanAccessPeer, hipSuccess -- real HIP names, not the CUDA-compat shim's aliases
 #include <cstdint>
 #include <functional>
 #include <string>
