@@ -1,0 +1,111 @@
+# Cross-compilation CI — verify cuda2rocm headers compile for gfx942.
+#
+# This workflow compiles every header (shims, cuco-rocm, cucascade-rocm) with
+# hipcc --offload-arch=gfx942. It does NOT run any GPU kernels (that needs a
+# real AMD GPU at /dev/kfd). Cross-compilation for --offload-arch doesn't need
+# the device present — it's real compile verification (syntax, type checks,
+# template instantiation) without hardware.
+#
+# For the cuco-rocm .cu tests, compilation is real signal; execution is gated
+# on /dev/kfd (same pattern as sirius-rocm's rocm-test.yml).
+name: Compile Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'cuda-compat-shims/**'
+      - 'cuco-rocm/**'
+      - 'cucascade-rocm/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/compile-test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile-test:
+    name: Cross-compile headers (gfx942, no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ROCm (apt)
+        run: |
+          # Install ROCm packages for the CI runner. On a self-hosted runner
+          # with ROCm pre-installed, this step is a no-op.
+          if ! command -v hipcc &>/dev/null; then
+            echo "hipcc not found. Installing ROCm packages..."
+            wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
+            echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.2 noble main" \
+              | sudo tee /etc/apt/sources.list.d/rocm.list
+            # Pin the radeon.com origin above Ubuntu's own repos so apt picks
+            # the ROCm repo's versions (same fix sirius-rocm's CI needed —
+            # without this, apt's default version resolver picks Ubuntu's
+            # generic hipcc/rocm-cmake packages, which have unmet deps).
+            echo -e "Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1001" \
+              | sudo tee /etc/apt/preferences.d/rocm-pin-600 > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y rocm-dev rocm-utils hipcub-dev rocthrust-dev
+          else
+            echo "hipcc already available: $(hipcc --version | head -1)"
+          fi
+
+      - name: Compile shim headers
+        run: |
+          # Compile a test TU that includes every shim component. This is the
+          # same test sirius-rocm's CI runs against the shim layer.
+          cat > /tmp/test_shim.cu << 'EOF'
+          #include <cuda_runtime.h>
+          #include <cub/cub.cuh>
+          #include <cuda/std/limits>
+          #include <cuda/functional>
+          #include <cuda/cmath>
+          #include <cooperative_groups.h>
+          __global__ void k(int* o) {
+            int v = cub::ShuffleIndex<64>(1, 0, 0xFFFFFFFFFFFFFFFFull);
+            *o = v + cuda::std::numeric_limits<int>::max()
+                   + cuda::ceil_div(100, 64) + cuda::minimum<int>{}(3, 5);
+          }
+          int main() { return 0; }
+          EOF
+          hipcc -c -x hip /tmp/test_shim.cu -o /dev/null \
+            -I cuda-compat-shims/include --offload-arch=gfx942
+          echo "Shim compile: EXIT=$?"
+
+      - name: Compile cuco-rocm tests
+        run: |
+          # Compile (don't run) the cuco-rocm .cu tests. Running needs /dev/kfd.
+          hipcc -o /tmp/test_bf cuco-rocm/tests/test_bloom_filter.cu \
+            -I cuco-rocm/include -I cuda-compat-shims/include --offload-arch=gfx942
+          echo "test_bloom_filter compile: EXIT=$?"
+
+          hipcc -o /tmp/test_ss cuco-rocm/tests/test_static_set.cu \
+            -I cuco-rocm/include -I cuda-compat-shims/include --offload-arch=gfx942
+          echo "test_static_set compile: EXIT=$?"
+
+          # Actually RUNNING these needs a real AMD GPU (/dev/kfd). GitHub-hosted
+          # ubuntu-latest doesn't have one — compile-only is real signal (HIP
+          # cross-compilation for --offload-arch doesn't need the device).
+          # On a self-hosted ROCm runner, both binaries run for full verification.
+          if [ -e /dev/kfd ]; then
+            echo "Real ROCm device detected -- running compiled tests"
+            /tmp/test_bf
+            /tmp/test_ss
+          else
+            echo "No /dev/kfd (expected on GitHub-hosted) -- compile-only verification passed."
+          fi
+
+      - name: Compile cucascade-rocm host-logic test
+        run: |
+          # test_cucascade_compile.cpp stubs rmm locally and tests the non-GPU
+          # logic headers (oom policy, converter registry, repository). It
+          # compiles with hipcc (C++20) without needing hipMM installed.
+          hipcc -std=c++20 -DRMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED \
+            -I cucascade-rocm/include -I cuda-compat-shims/include \
+            -o /tmp/test_cucascade cucascade-rocm/tests/test_cucascade_compile.cpp
+          echo "test_cucascade compile: EXIT=$?"
+          /tmp/test_cucascade

@@ -61,17 +61,12 @@ cuCascade is NVIDIA's GPU memory-reservation and out-of-core data repository sys
 
 **Approach:** Use hipMM's `rmm::device_async_resource_ref` as the allocator interface, rocThrust/hipCUB for data movement. Match cuCascade's API exactly.
 
-**Status:** 32 headers, of which **26 are real implementations** and **6 still throw at runtime** (→ DuckDB CPU fallback). Verified by grepping every header for the `throw std::runtime_error("cuCascade stub: ...")` marker — the genuine stubs are:
+**Status:** 32 headers, of which **30 are real implementations** and **2 still throw at runtime** (→ DuckDB CPU fallback). Verified by grepping every header for the `throw std::runtime_error("cuCascade stub: ...")` marker — the genuine stubs are:
 
-- `memory/small_pinned_host_memory_resource.hpp` — `allocate` / `operator rmm::...` throw
-- `memory/numa_region_pinned_host_allocator.hpp` — `allocate` / `operator rmm::...` throw
-- `cudf/gpu_data_representation.hpp` — `clone()` throws
-- `cudf/host_data_representation.hpp` — `clone()` throws
 - `data/disk_data_representation.hpp` — `get_disk_table()` / `clone()` throw
-- `data/data_batch.hpp` — `clone_to` / `clone` / `set_data` / `convert_to` throw
-- `cudf/builtin_converters.hpp` — `register_builtin_converters` is a no-op (no converters registered → `representation_converter::convert` throws "no converter registered")
+- `memory/numa_region_pinned_host_allocator.hpp` — `allocate` / `operator rmm::...` throw
 
-The remaining 26 headers are real implementations (not just the 7 previously listed). The full memory-reservation subsystem (`memory_space`, `reservation`, `memory_reservation_manager`, `fixed_size_host_memory_resource`, `reservation_aware_resource_adaptor`, `oom_handling_policy`, `error`), the full topology + event subsystem, the data-repository containers (`data_repository`, `data_repository_manager`), the representation base + converter registry, and the config/common/POD types are all ported. The genuine stubs are concentrated in the data-representation `clone()` methods (deep-copy paths not yet exercised by Sirius) and the two pinned-host allocator variants (NUMA-aware + small-block, which delegate to the real `fixed_size_host_memory_resource` once ported).
+The remaining 30 headers are real implementations. The full memory-reservation subsystem (`memory_space`, `reservation`, `memory_reservation_manager`, `fixed_size_host_memory_resource`, `reservation_aware_resource_adaptor`, `oom_handling_policy`, `error`, `small_pinned_host_memory_resource`), the full topology + event subsystem, the data-repository containers (`data_repository`, `data_repository_manager`), the data-batch lifecycle (`data_batch` clone/convert/set_data), the representation types (`gpu_table_representation::clone` via cudf::copy, `host_data_representation::clone` via hipMemcpyAsync), the representation converter registry, and the config/common/POD types are all ported. The 2 remaining stubs are the disk-data representation clone (deep-copy from disk, not yet exercised) and the NUMA-aware pinned allocator (needs numactl/mbind integration).
 
 See `cucascade-rocm/docs/api-surface.md` for the full API mapping and which scope items remain.
 
@@ -105,13 +100,16 @@ no claim):
 
 - **Shim layer:** 0 compile errors on gfx942/ROCm 7.2.1 (hipcc 7.2.53211) —
   verified in sirius-rocm's CI (`.github/workflows/rocm-test.yml`, green).
-- **cucascade-rocm pure-logic headers:** 4 of the 26 real headers
+- **cucascade-rocm pure-logic headers:** 4 of the 30 real headers
   (`column_metadata`, `notification_channel`, `disk_table`,
   `chunked_resource_info`) compile clean with g++ -std=c++20 (no HIP
-  dependency). The remaining 22 real headers transitively include
+  dependency). The remaining 26 real headers transitively include
   `hip/hip_runtime.h` via the cuda-compat-shims and require a HIP toolchain
-  to compile-verify — not yet done in this repo's CI (pending a self-hosted
-  ROCm runner).
+  to compile-verify — a cross-compilation CI job
+  (`.github/workflows/compile-test.yml`) now compiles the shim layer, the
+  cuco-rocm tests, and the host-logic test with hipcc --offload-arch=gfx942
+  on every push/PR (no GPU needed for compilation; runtime execution is
+  gated on /dev/kfd).
 - **cuco-rocm bloom_filter / static_set:** **NOT verified.** The test
   binaries are written and assert 7/7 keys found / 6/6 correct, but have not
   been compiled with hipcc or run on a real AMD GPU. An earlier version of
