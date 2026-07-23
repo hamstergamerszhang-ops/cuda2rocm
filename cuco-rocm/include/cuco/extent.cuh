@@ -56,7 +56,7 @@ using bucket_extent = extent<SizeType>;
 /// make_bucket_extent factory — creates a bucket_extent from a size.
 template <int32_t CGSize, int32_t BucketSize, typename SizeType,
           std::size_t N = dynamic_extent>
-__host__ constexpr auto make_bucket_extent(extent<SizeType, N> const& ext) {
+__host__ constexpr auto make_bucket_extent(bucket_extent<SizeType, N> const& ext) {
   return extent<SizeType>(ext);
 }
 
