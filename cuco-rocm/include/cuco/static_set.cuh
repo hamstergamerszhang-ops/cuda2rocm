@@ -116,6 +116,23 @@ struct set_ref {
   }
 };
 
+/// static_set_ref — NVIDIA cuco API used by hipDF's groupby/hash helpers.cuh.
+/// The real NVIDIA cuco has a 6-template-param static_set_ref:
+///   <KeyT, Scope, Comparator, ProbingScheme, Storage, Op>
+/// hipDF instantiates this with specific types. We provide a compatible shim
+/// that accepts 6 params but delegates to the 2-param set_ref (ignoring the
+/// extra params via a variadic pack). The key API hipDF uses is operator()
+/// (probe) and contains().
+template <typename KeyT, int Scope = 0, typename Comparator = void,
+          typename ProbingScheme = void, typename Storage = void,
+          typename Op = void>
+struct static_set_ref : set_ref<KeyT, double_hashing<1, default_hash_function<KeyT>>> {
+  using base_type = set_ref<KeyT, double_hashing<1, default_hash_function<KeyT>>>;
+  using base_type::base_type;
+  using base_type::operator();
+  using base_type::contains;
+};
+
 /// GPU open-addressing hash set.
 template <typename KeyT,
           typename Extent = extent<std::size_t>,
