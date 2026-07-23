@@ -9,8 +9,15 @@
 
 #pragma once
 
+// Real rmm headers are skipped when a caller has already stubbed
+// rmm::device_async_resource_ref (see test_cucascade_compile.cpp) -- lets the
+// pure-logic host test compile without hipMM installed. RMM_DEVICE_ASYNC_
+// RESOURCE_REF_STUBBED must be defined (and rmm::device_async_resource_ref
+// declared) before this header is included, in that case.
+#ifndef RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
+#endif
 #include <cstdint>
 #include <functional>
 #include <string>

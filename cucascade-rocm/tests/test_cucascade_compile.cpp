@@ -37,6 +37,9 @@
 namespace rmm {
 struct device_async_resource_ref {};
 inline device_async_resource_ref get_current_device_resource() { return {}; }
+// cuda_stream_view is only ever default-constructed and passed around in
+// this test (never called into) -- an empty stub covers every real usage.
+struct cuda_stream_view {};
 }  // namespace rmm
 #endif
 
