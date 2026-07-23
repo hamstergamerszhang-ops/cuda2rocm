@@ -54,21 +54,19 @@ cuCascade is NVIDIA's GPU memory-reservation and out-of-core data repository sys
 
 **Approach:** Use hipMM's `rmm::device_async_resource_ref` as the allocator interface, rocThrust/hipCUB for data movement. Match cuCascade's API exactly.
 
-**Status:** 32 headers, of which **7 are real implementations** (verified):
-- `memory/memory_space.hpp` — real reservation tracking (make_reservation*, release_reservation, get_memory_resource_as/of)
-- `memory/stream_pool.hpp` — real hipStreamCreateWithFlags pool
-- `memory/topology_discovery.hpp` — real hipGetDeviceCount/hipGetDeviceProperties/hipDeviceGetPCIBusId
-- `memory/disk_access_limiter.hpp` — real atomic CAS semaphore
-- `cuda/event.hpp` — real hipEvent* wrappers
-- `memory/reservation_manager_configurator.hpp` — real builder
-- `data/representation_converter.hpp` — real registry
+**Status:** 32 headers, of which **26 are real implementations** and **6 still throw at runtime** (→ DuckDB CPU fallback). Verified by grepping every header for the `throw std::runtime_error("cuCascade stub: ...")` marker — the genuine stubs are:
 
-The remaining 25 throw at runtime (→ DuckDB CPU fallback). Real implementations are staged:
-1. Memory reservation subsystem (`memory_space`, `reservation`, `memory_reservation_manager`) — ✅ done
-2. Data repository (`data_batch`, `data_repository`, `data_repository_manager`) — ✅ done
-3. Topology discovery + disk representations — ✅ done (topology); disk representations stubbed
+- `memory/small_pinned_host_memory_resource.hpp` — `allocate` / `operator rmm::...` throw
+- `memory/numa_region_pinned_host_allocator.hpp` — `allocate` / `operator rmm::...` throw
+- `cudf/gpu_data_representation.hpp` — `clone()` throws
+- `cudf/host_data_representation.hpp` — `clone()` throws
+- `data/disk_data_representation.hpp` — `get_disk_table()` / `clone()` throw
+- `data/data_batch.hpp` — `clone_to` / `clone` / `set_data` / `convert_to` throw
+- `cudf/builtin_converters.hpp` — `register_builtin_converters` is a no-op (no converters registered → `representation_converter::convert` throws "no converter registered")
 
-See `cucascade-rocm/docs/api-surface.md` for the full API mapping.
+The remaining 26 headers are real implementations (not just the 7 previously listed). The full memory-reservation subsystem (`memory_space`, `reservation`, `memory_reservation_manager`, `fixed_size_host_memory_resource`, `reservation_aware_resource_adaptor`, `oom_handling_policy`, `error`), the full topology + event subsystem, the data-repository containers (`data_repository`, `data_repository_manager`), the representation base + converter registry, and the config/common/POD types are all ported. The genuine stubs are concentrated in the data-representation `clone()` methods (deep-copy paths not yet exercised by Sirius) and the two pinned-host allocator variants (NUMA-aware + small-block, which delegate to the real `fixed_size_host_memory_resource` once ported).
+
+See `cucascade-rocm/docs/api-surface.md` for the full API mapping and which scope items remain.
 
 ## Build
 
