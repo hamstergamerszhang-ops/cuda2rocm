@@ -44,14 +44,14 @@ class host_data_representation : public idata_representation {
   /// its own buffer independent of the original (a mutation to one does not
   /// affect the other). Mirrors cuCascade's host_data_representation::clone.
   ///
-  /// Ownership: the raw hipMallocHost buffer is wrapped in a shared_ptr<void>
-  /// with a custom deleter that calls hipFreeHost. That shared_ptr is stored
-  /// inside the cloned multiple_blocks_allocation's blocks_ as a block entry
-  /// (so Sirius's get_blocks() works), AND the shared_ptr<void> itself is
-  /// kept alive by being captured in the host_table_allocation's allocation
-  /// shared_ptr (which holds the multiple_blocks_allocation, which holds the
-  /// block). When the last reference to the cloned allocation dies, the
-  /// deleter runs and hipFreeHost frees the buffer — no leak.
+  /// Ownership: the raw hipMallocHost buffer is freed when the
+  /// multiple_blocks_allocation that holds it is destroyed. We achieve this
+  /// by constructing the allocation on the heap (new) and wrapping it in a
+  /// shared_ptr with a custom deleter that calls hipFreeHost(new_buf) AND
+  /// deletes the allocation. This is the same RAII pattern used in
+  /// builtin_converters.hpp's gpu→host converter. The blocks_ vector inside
+  /// the allocation holds a block{new_buf, total_bytes} so Sirius's
+  /// get_blocks() sees the buffer; the deleter ensures it's freed.
   std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override {
     if (!table_) {
       return std::make_unique<host_data_representation>(
@@ -89,43 +89,21 @@ class host_data_representation : public idata_representation {
       }
     }
 
-    // Wrap the raw buffer in a multiple_blocks_allocation with a RAII deleter.
-    // The shared_ptr<void> guard keeps new_buf alive; it's stored as a member
-    // of the allocation so its lifetime is tied to the allocation's refcount.
-    auto new_alloc = std::make_shared<memory::fixed_size_host_memory_resource::multiple_blocks_allocation>();
+    // Build the cloned allocation. Construct on the heap, then wrap in a
+    // shared_ptr with a custom deleter that frees the hipMallocHost buffer
+    // when the allocation's refcount drops to zero. This is the only correct
+    // way to tie a raw HIP buffer's lifetime to a multiple_blocks_allocation
+    // without modifying fixed_size_host_memory_resource.hpp (whose blocks_
+    // are plain POD structs with no deleter).
+    using Alloc = memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
+    Alloc* raw_alloc = new Alloc();
+    std::shared_ptr<Alloc> new_alloc(raw_alloc, [new_buf](Alloc* p) {
+      if (new_buf) hipFreeHost(new_buf);
+      delete p;
+    });
     if (total_bytes > 0 && new_buf) {
-      new_alloc->blocks_.emplace_back(new_buf, total_bytes);
-      new_alloc->total_bytes_ = total_bytes;
-      // Store a shared_ptr<void> with a hipFreeHost deleter inside the
-      // allocation so the buffer is freed when the allocation is destroyed.
-      // We piggyback on the arena_ field (a reserved_arena* we don't use for
-      // clones) by reinterpret-casting — no, that's type-unsafe. Instead, we
-      // rely on the fact that host_table_allocation's destructor will run and
-      // the multiple_blocks_allocation's blocks_ will be destroyed, but blocks_
-      // are plain block structs (ptr + bytes) with no deleter.
-      //
-      // CORRECT approach: we add a `std::shared_ptr<void> owned_buffer_` field
-      // to multiple_blocks_allocation (it already has arena_ as a custom field;
-      // adding one more is consistent with the existing pattern). But modifying
-      // multiple_blocks_allocation means changing fixed_size_host_memory_resource.hpp.
-      //
-      // SIMPLEST correct approach that doesn't touch another header: wrap the
-      // entire multiple_blocks_allocation + buffer in a shared_ptr with a
-      // custom deleter that frees both, via the aliasing constructor. The
-      // host_table_allocation::allocation field is a shared_ptr<multiple_blocks_allocation>,
-      // so we can give it a deleter that also frees the buffer.
-      auto raw_alloc = new_alloc.get();
-      auto combined_deleter = [new_buf](memory::fixed_size_host_memory_resource::multiple_blocks_allocation* p) {
-        if (new_buf) hipFreeHost(new_buf);
-        delete p;
-      };
-      // Aliasing constructor: the new shared_ptr shares ownership with a
-      // dummy, but points to raw_alloc and uses combined_deleter. Actually,
-      // the aliasing constructor doesn't let us set a custom deleter on the
-      // aliased object. Use the regular constructor instead:
-      std::shared_ptr<memory::fixed_size_host_memory_resource::multiple_blocks_allocation>
-        owned_alloc(raw_alloc, combined_deleter);
-      new_alloc = owned_alloc;
+      raw_alloc->blocks_.emplace_back(new_buf, total_bytes);
+      raw_alloc->total_bytes_ = total_bytes;
     }
 
     auto cloned_table = memory::host_table_allocation::create(new_alloc, std::move(cols), total_bytes);
