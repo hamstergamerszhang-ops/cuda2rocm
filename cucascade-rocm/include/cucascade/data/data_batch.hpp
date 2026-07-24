@@ -26,6 +26,9 @@ namespace cucascade::memory { class memory_space; }
 
 namespace cucascade {
 
+class data_batch;  // defined below -- clone()/clone_to() bodies need it complete,
+                    // so they're declared here and defined out-of-line after it.
+
 /// Read-only view of a data batch (copyable, holds a shared reference).
 class read_only_data_batch {
  public:
@@ -52,36 +55,25 @@ class read_only_data_batch {
   /// host_data_representation) when VRAM is tight. The converter is looked up
   /// by (source_type, target_type) in the registry; if no converter is
   /// registered, convert() throws (the registry's own error, not a stub).
+  /// Body defined out-of-line below, after data_batch is complete -- calls
+  /// data_batch::make(), which needs a complete type, not just the forward
+  /// declaration in scope here.
   template <typename TargetRepr>
-  std::shared_ptr<class data_batch> clone_to(representation_converter_registry& registry,
-                                             uint64_t new_batch_id,
-                                             memory::memory_space const* target_space,
-                                             rmm::cuda_stream_view stream,
-                                             std::unique_ptr<idata_batch_probe> /*probe*/ = {}) {
-    if (!data_) {
-      throw std::runtime_error("cuCascade: read_only_data_batch::clone_to on null data");
-    }
-    auto converted = registry.convert<TargetRepr>(*data_, target_space, stream);
-    auto* target_space_mut = const_cast<memory::memory_space*>(target_space);
-    return data_batch::make(new_batch_id, std::move(converted), {},
-                            target_space_mut);
-  }
+  std::shared_ptr<data_batch> clone_to(representation_converter_registry& registry,
+                                       uint64_t new_batch_id,
+                                       memory::memory_space const* target_space,
+                                       rmm::cuda_stream_view stream,
+                                       std::unique_ptr<idata_batch_probe> probe = {});
 
   /// Deep-copy this batch's data representation (same type, same tier) into a
   /// new data_batch with a new batch_id. Delegates to
   /// idata_representation::clone(), which is implemented per representation
   /// type (host_data_representation::clone does hipMemcpyAsync; gpu_table does
   /// cudf::copy). The clone is independent — mutations to one don't affect
-  /// the other.
-  std::shared_ptr<class data_batch> clone(uint64_t new_batch_id,
-                                          rmm::cuda_stream_view stream,
-                                          std::unique_ptr<idata_batch_probe> /*probe*/ = {}) {
-    if (!data_) {
-      throw std::runtime_error("cuCascade: read_only_data_batch::clone on null data");
-    }
-    auto cloned = data_->clone(stream);
-    return data_batch::make(new_batch_id, std::move(cloned), {}, space_);
-  }
+  /// the other. Body defined out-of-line below, same reason as clone_to.
+  std::shared_ptr<data_batch> clone(uint64_t new_batch_id,
+                                    rmm::cuda_stream_view stream,
+                                    std::unique_ptr<idata_batch_probe> probe = {});
 
  protected:
   std::shared_ptr<idata_representation> data_;
@@ -131,20 +123,13 @@ class mutable_data_batch {
   /// Convert + wrap in a new data_batch (same as read_only_data_batch::clone_to
   /// but from the mutable view). The mutable batch's data is NOT consumed —
   /// the converter produces a new representation from the existing one.
+  /// Body defined out-of-line below, same reason as read_only_data_batch::clone_to.
   template <typename TargetRepr>
-  std::shared_ptr<class data_batch> clone_to(representation_converter_registry& registry,
-                                             uint64_t new_batch_id,
-                                             memory::memory_space const* target_space,
-                                             rmm::cuda_stream_view stream,
-                                             std::unique_ptr<idata_batch_probe> = {}) {
-    if (!data_) {
-      throw std::runtime_error("cuCascade: mutable_data_batch::clone_to on null data");
-    }
-    auto converted = registry.convert<TargetRepr>(*data_, target_space, stream);
-    auto* target_space_mut = const_cast<memory::memory_space*>(target_space);
-    return data_batch::make(new_batch_id, std::move(converted), {},
-                            target_space_mut);
-  }
+  std::shared_ptr<data_batch> clone_to(representation_converter_registry& registry,
+                                       uint64_t new_batch_id,
+                                       memory::memory_space const* target_space,
+                                       rmm::cuda_stream_view stream,
+                                       std::unique_ptr<idata_batch_probe> probe = {});
 
  private:
   std::shared_ptr<idata_representation> data_;
@@ -226,5 +211,46 @@ class data_batch {
   memory::memory_space* space_{nullptr};
   std::size_t subscriber_count_{0};
 };
+
+// Out-of-line bodies for the clone()/clone_to() methods declared above --
+// data_batch is a complete type from here on, so data_batch::make() resolves.
+// (No default arguments repeated here -- those live on the in-class
+// declarations only, per the one-default-per-parameter C++ rule.)
+
+template <typename TargetRepr>
+std::shared_ptr<data_batch> read_only_data_batch::clone_to(
+    representation_converter_registry& registry, uint64_t new_batch_id,
+    memory::memory_space const* target_space, rmm::cuda_stream_view stream,
+    std::unique_ptr<idata_batch_probe> /*probe*/) {
+  if (!data_) {
+    throw std::runtime_error("cuCascade: read_only_data_batch::clone_to on null data");
+  }
+  auto converted = registry.convert<TargetRepr>(*data_, target_space, stream);
+  auto* target_space_mut = const_cast<memory::memory_space*>(target_space);
+  return data_batch::make(new_batch_id, std::move(converted), {}, target_space_mut);
+}
+
+inline std::shared_ptr<data_batch> read_only_data_batch::clone(
+    uint64_t new_batch_id, rmm::cuda_stream_view stream,
+    std::unique_ptr<idata_batch_probe> /*probe*/) {
+  if (!data_) {
+    throw std::runtime_error("cuCascade: read_only_data_batch::clone on null data");
+  }
+  auto cloned = data_->clone(stream);
+  return data_batch::make(new_batch_id, std::move(cloned), {}, space_);
+}
+
+template <typename TargetRepr>
+std::shared_ptr<data_batch> mutable_data_batch::clone_to(
+    representation_converter_registry& registry, uint64_t new_batch_id,
+    memory::memory_space const* target_space, rmm::cuda_stream_view stream,
+    std::unique_ptr<idata_batch_probe> /*probe*/) {
+  if (!data_) {
+    throw std::runtime_error("cuCascade: mutable_data_batch::clone_to on null data");
+  }
+  auto converted = registry.convert<TargetRepr>(*data_, target_space, stream);
+  auto* target_space_mut = const_cast<memory::memory_space*>(target_space);
+  return data_batch::make(new_batch_id, std::move(converted), {}, target_space_mut);
+}
 
 }  // namespace cucascade
