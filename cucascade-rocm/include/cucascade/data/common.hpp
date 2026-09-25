@@ -8,7 +8,9 @@
 #pragma once
 #include "cucascade/memory/common.hpp"
 #include "cucascade/error.hpp"
+#ifndef RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
 #include <rmm/cuda_stream.hpp>
+#endif
 #include <cuda_runtime.h>  // shim → hip runtime (for hipEvent*)
 #include <cstddef>
 #include <memory>

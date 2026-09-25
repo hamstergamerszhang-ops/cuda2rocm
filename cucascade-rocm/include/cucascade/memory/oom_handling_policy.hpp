@@ -9,7 +9,11 @@
 #pragma once
 
 #include "cucascade/memory/error.hpp"
+// Same stub-gate as common.hpp -- skip the real header when a caller has
+// already stubbed rmm::cuda_stream_view (see test_cucascade_compile.cpp).
+#ifndef RMM_DEVICE_ASYNC_RESOURCE_REF_STUBBED
 #include <rmm/cuda_stream.hpp>
+#endif
 #include <cstddef>
 #include <exception>
 #include <functional>

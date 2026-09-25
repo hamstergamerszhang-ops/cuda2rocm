@@ -79,10 +79,26 @@ real implementations (not stubs) for the core subsystem:
 
 ## Status
 
-A compile-only stub set is provided in this repo at
-`cucascade-rocm/include/cucascade/` (consumed by Sirius via FetchContent).
-7 of the 32 headers are real implementations (memory_space, stream_pool,
-topology_discovery, event, disk_access_limiter, representation_converter,
-reservation_manager_configurator); the remaining 25 throw at runtime
-(→ DuckDB CPU fallback). This project is replacing those stubs with real
-implementations.
+The headers in `cucascade-rocm/include/cucascade/` (consumed by Sirius via
+FetchContent) are **30 real implementations + 2 genuine stubs** (verified by
+grepping every header for the `throw std::runtime_error("cuCascade stub: ...")`
+marker). An earlier version of this doc claimed "7 real / 25 stub" — that was
+stale; the port progressed well past it.
+
+The 2 genuine stubs are:
+
+| Header | What throws |
+|---|---|
+| `data/disk_data_representation.hpp` | `get_disk_table()`, `clone()` |
+| `memory/numa_region_pinned_host_allocator.hpp` | `allocate`, `operator rmm::...` |
+
+The remaining 30 headers — including the full memory-reservation subsystem,
+the data-batch lifecycle (clone/convert/set_data), the representation types
+(gpu/host clone via cudf::copy / hipMemcpyAsync), topology discovery, events,
+the data-repository containers, and the representation converter registry —
+are real implementations backed by hipMalloc/hipMallocHost/hipEvent*/
+hipGetDevice* calls, not stubs. (Two headers, `error.hpp` and `data/common.hpp`,
+use the string "cuCascade stub:" as a cosmetic prefix on real runtime guards —
+a CUDA-error wrapper macro and a dynamic_cast-null check — not as stub markers.)
+
+
